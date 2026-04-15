@@ -93,7 +93,15 @@ cp config.example.yaml config.yaml
 $EDITOR config.yaml
 ```
 
-完整配置说明见下面的 [配置](#配置) 小节 —— 示例文件里每个字段都有注释。
+`config.example.yaml` 已经预填了一整套 Amp CLI 的模型映射表（9 条，覆盖
+Amp CLI 主 agent 和子 agent 会用到的 claude / gpt / gemini 系列）。你
+通常只需要再做三件事：
+
+1. 把 `custom-providers` 下的占位条目换成你自己网关的 `url` 和 `api-key`
+2. 选一个 `gemini-route-mode`（`ampcode` 或 `translate`）
+3. 如果希望 ampcode.com 兜底可用，填 `upstream-api-key`
+
+完整配置说明见下面的 [配置](#配置) 小节。
 
 ### 运行
 

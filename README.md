@@ -100,8 +100,17 @@ cp config.example.yaml config.yaml
 $EDITOR config.yaml
 ```
 
-See the [Configuration](#configuration) section below for a full
-walkthrough — the example file ships with every field commented.
+`config.example.yaml` ships with the full Amp CLI model-routing table
+pre-filled (9 mappings covering the claude / gpt / gemini families that
+Amp CLI actually requests). To finish setup you typically only need to:
+
+1. Replace the placeholder entry under `custom-providers` with your
+   gateway's real `url` and `api-key`.
+2. Pick a `gemini-route-mode` (`ampcode` or `translate`).
+3. Set `upstream-api-key` if you want the ampcode.com fallback to work.
+
+See the [Configuration](#configuration) section below for the full
+walkthrough.
 
 ### Run
 

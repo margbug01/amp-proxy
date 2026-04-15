@@ -26,15 +26,39 @@ ampcode:
   restrict-management-to-localhost: true
 
   # Model mappings — rewrite the "model" field in requests before forwarding.
-  # Use this to send an Amp CLI model to a different upstream model name.
-  model-mappings: []
-    # - from: "claude-opus-4-6"
-    #   to: "gpt-5.4(high)"
-    # - from: "gemini-3-flash-preview"
-    #   to: "gpt-5.4-mini(high)"
+  #
+  # The block below covers every model Amp CLI's main agent and subagents
+  # normally request (claude opus/sonnet/haiku, gpt-5.4 family, gemini
+  # 2.5-flash-lite, gemini-3-flash-preview) and redirects them all to a
+  # gpt-5.4 / gpt-5.4-mini backend configured under `custom-providers`.
+  # If your gateway exposes different model names, change the "to:"
+  # values; the "from:" side must stay as shown so Amp CLI's own model
+  # strings keep matching.
+  model-mappings:
+    - from: "claude-opus-4-6"
+      to: "gpt-5.4(high)"
+    - from: "claude-sonnet-4-6-thinking"
+      to: "gpt-5.4-mini(high)"
+    - from: "claude-haiku-4-5-20251001"
+      to: "gpt-5.4-mini"
+    - from: "gpt-5.4"
+      to: "gpt-5.4(xhigh)"
+    - from: "gemini-2.5-flash-lite-preview-09-2025"
+      to: "gpt-5.4-mini"
+    - from: "gemini-2.5-flash-lite"
+      to: "gpt-5.4-mini"
+    - from: "claude-sonnet-4-6"
+      to: "gpt-5.4-mini(high)"
+    - from: "gpt-5.3-codex"
+      to: "gpt-5.4(high)"
+    - from: "gemini-3-flash-preview"
+      to: "gpt-5.4-mini(high)"
 
-  # If true, model mappings take precedence over local providers.
-  force-model-mappings: false
+  # Route mapped models ahead of local providers. True is the right
+  # default when you are using the model-mappings block above; flip to
+  # false only if you want the original model to win whenever a local
+  # OAuth provider claims it.
+  force-model-mappings: true
 
   # Custom upstream providers — route specific models to a third-party
   # OpenAI-compatible endpoint instead of ampcode.com. Request body's
