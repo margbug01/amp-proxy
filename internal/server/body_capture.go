@@ -77,6 +77,12 @@ func bodyCapture(dir, pathSubstring string) gin.HandlerFunc {
 		ts := time.Now().Format("150405.000")
 		safePath := strings.Trim(c.Request.URL.Path, "/")
 		safePath = strings.ReplaceAll(safePath, "/", "_")
+		// Windows treats ':' as an NTFS alternate-data-stream separator, so a
+		// filename like "foo:generateContent.log" silently becomes an empty
+		// "foo" file with the bytes tucked into the ":generateContent.log"
+		// stream. Google v1beta paths end in ":generateContent" so replace
+		// unconditionally to keep capture files portable.
+		safePath = strings.ReplaceAll(safePath, ":", "_")
 		if safePath == "" {
 			safePath = "root"
 		}
