@@ -2,90 +2,83 @@
 
 # amp-proxy
 
-**A focused reverse proxy for the [Sourcegraph Amp CLI](https://ampcode.com)**
+**专注的 [Sourcegraph Amp CLI](https://ampcode.com) 反向代理**
 
-Route specific models to third-party OpenAI-compatible endpoints, translate
-Gemini requests into OpenAI Responses, and patch a handful of Amp-path bugs
-along the way.
+把指定 model 路由到第三方 OpenAI 兼容端点、将 Gemini 请求翻译成 OpenAI Responses，
+并顺手修复 Amp 路径上的几个 bug。
 
 [![CI](https://github.com/margbug01/amp-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/margbug01/amp-proxy/actions/workflows/ci.yml)
 [![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)](go.mod)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Derived from](https://img.shields.io/badge/derived%20from-CLIProxyAPI-8A2BE2)](https://github.com/router-for-me/CLIProxyAPI)
 
-**English** · [简体中文](README_zh-CN.md)
+[English](README_en.md) · **简体中文**
 
 </div>
 
 ---
 
-## Why amp-proxy
+## 为什么需要 amp-proxy
 
-Running Amp CLI against a self-hosted OpenAI-compatible gateway instead of
-`ampcode.com` is a useful pattern — it gives you control over model choice
-and billing. Upstream [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
-can do this in principle, but its Amp path has a few rough edges on
-third-party providers:
+把 Amp CLI 指向你自己搭的 OpenAI 兼容网关（而不是 `ampcode.com`）是一种
+很常见的用法 —— 你能自己决定用哪个 model、怎么计费。上游
+[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 理论上能做到，
+但它的 Amp 路径在对接第三方 provider 时有几个粗糙的地方：
 
-- Non-streaming `/v1/messages` requests (used by Amp CLI's `librarian`
-  subagent) silently return empty content from some upstreams, breaking
-  tool calls.
-- Google `v1beta1 generateContent` requests (used by the `finder`
-  subagent) 404 on gateways that only speak OpenAI Responses or
-  Anthropic Messages.
-- A handful of Windows-hosting, logging, and stream-handling papercuts.
+- 非流式 `/v1/messages` 请求（Amp CLI 的 `librarian` 子 agent 会用）在某些
+  上游会悄悄返回空 content，导致工具调用失败。
+- Google `v1beta1 generateContent` 请求（`finder` 子 agent 会用）在只讲
+  OpenAI Responses 或 Anthropic Messages 的网关上直接 404。
+- Windows 部署、日志、流式处理上还有几个小毛病。
 
-`amp-proxy` is the minimum subset of CLIProxyAPI needed to host the Amp
-reverse proxy, plus a small `customproxy` package that routes models to
-third-party endpoints and translates between protocols.
+`amp-proxy` 是从 CLIProxyAPI 里抽出来、刚好够跑 Amp 反向代理的最小子集，
+再加上一个 `customproxy` 包负责按 model 路由到第三方端点并做协议翻译。
 
 ---
 
-## How it works
+## 工作原理
 
 ```mermaid
 flowchart LR
     A[Amp CLI] -->|/api/provider/...| B(amp-proxy)
-    B --> C{model<br/>routed?}
-    C -->|matched by<br/>custom-provider| D[your<br/>OpenAI-compat<br/>gateway]
-    C -->|no match| E[ampcode.com<br/>fallback]
-    C -. Gemini +<br/>translate mode .-> T[Gemini ⇄ OpenAI<br/>Responses translator] -.-> D
+    B --> C{命中<br/>自定义<br/>provider?}
+    C -->|custom-provider<br/>匹配| D[你的<br/>OpenAI 兼容<br/>网关]
+    C -->|未匹配| E[ampcode.com<br/>兜底]
+    C -. Gemini +<br/>translate 模式 .-> T[Gemini ⇄ OpenAI<br/>Responses 翻译器] -.-> D
 ```
 
-1. Amp CLI sends a request; amp-proxy extracts the model name.
-2. Optional `model-mappings` rewrite the model name in place.
-3. If the rewritten model is claimed by a `custom-providers` entry, the
-   request is forwarded to that gateway with a Bearer token. **Amp
-   credits are not consumed.**
-4. Anything not claimed falls through to `ampcode.com` (or `upstream-url`).
-5. For Google Gemini v1beta paths, `gemini-route-mode: "translate"` runs
-   the request through a protocol translator first, so even `finder` can
-   ride on an OpenAI-only gateway.
+1. Amp CLI 发请求，amp-proxy 先提取 model 名
+2. 可选的 `model-mappings` 把 model 就地改写成别的名字
+3. 如果改写后的 model 被某个 `custom-providers` 条目认领，请求转发到该
+   网关并换上 Bearer token —— **不消耗 Amp credits**
+4. 没被认领的请求兜底走 `ampcode.com`（或 `upstream-url`）
+5. Google Gemini v1beta 路径在 `gemini-route-mode: "translate"` 下会先
+   经过一层协议翻译，这样连 `finder` 都能跑在纯 OpenAI 网关上
 
 ---
 
-## Features
+## 特性
 
-| Feature | What it does |
+| 特性 | 作用 |
 |---|---|
-| **Model-keyed routing** | Forward specific models to any OpenAI-compatible endpoint with one config entry. |
-| **Anthropic stream upgrade** | Non-streaming `/v1/messages` is silently upgraded to SSE on the wire and collapsed back downstream, working around upstream content loss. |
-| **Gemini ⇄ OpenAI translator** | Optionally rewrites `finder`'s `generateContent` calls into OpenAI Responses and translates the reply back into Gemini JSON. |
-| **Model mappings** | Rewrite `model` fields pre-routing (e.g. `claude-opus-4-6` → `gpt-5.4(high)`). |
-| **Hot reload** | Providers, mappings, and route modes reload without restart when `config.yaml` changes. |
-| **Ampcode fallback** | Anything not claimed by a custom provider transparently proxies to the Amp control plane. |
+| **基于 model 的路由** | 用一行配置把特定 model 转发到任意 OpenAI 兼容端点 |
+| **Anthropic 流式升级** | 把非流式 `/v1/messages` 在线路上悄悄升级成 SSE，再在下游折叠回单个 JSON，绕开上游丢 content 的 bug |
+| **Gemini ⇄ OpenAI 翻译器** | 可选地把 `finder` 的 `generateContent` 请求翻译成 OpenAI Responses，再把响应翻译回 Gemini JSON |
+| **Model 映射** | 路由前就地改写 `model` 字段（比如 `claude-opus-4-6` → `gpt-5.4(high)`） |
+| **热重载** | `config.yaml` 改动后 provider、映射、路由模式无需重启即可生效 |
+| **ampcode 兜底** | 没被自定义 provider 认领的流量透明转发到 Amp 控制平面 |
 
 ---
 
-## Quick start
+## 快速开始
 
-### Prerequisites
+### 前置要求
 
-- **Go 1.25+** (matches the toolchain declared in `go.mod`)
-- A local API key Amp CLI will present
-- Either an Amp upstream token, an OpenAI-compatible gateway, or both
+- **Go 1.25+**（和 `go.mod` 里声明的 toolchain 一致）
+- 一个本地 API key，用于 Amp CLI 认证
+- 要么有 Amp 上游 token，要么有 OpenAI 兼容网关，两者皆有也行
 
-### Build
+### 构建
 
 ```bash
 git clone https://github.com/margbug01/amp-proxy.git
@@ -93,48 +86,45 @@ cd amp-proxy
 go build -o amp-proxy .
 ```
 
-### Configure
+### 配置
 
 ```bash
 cp config.example.yaml config.yaml
 $EDITOR config.yaml
 ```
 
-`config.example.yaml` ships with the full Amp CLI model-routing table
-pre-filled (9 mappings covering the claude / gpt / gemini families that
-Amp CLI actually requests). To finish setup you typically only need to:
+`config.example.yaml` 已经预填了一整套 Amp CLI 的模型映射表（9 条，覆盖
+Amp CLI 主 agent 和子 agent 会用到的 claude / gpt / gemini 系列）。你
+通常只需要再做三件事：
 
-1. Replace the placeholder entry under `custom-providers` with your
-   gateway's real `url` and `api-key`.
-2. Pick a `gemini-route-mode` (`ampcode` or `translate`).
-3. Set `upstream-api-key` if you want the ampcode.com fallback to work.
+1. 把 `custom-providers` 下的占位条目换成你自己网关的 `url` 和 `api-key`
+2. 选一个 `gemini-route-mode`（`ampcode` 或 `translate`）
+3. 如果希望 ampcode.com 兜底可用，填 `upstream-api-key`
 
-See the [Configuration](#configuration) section below for the full
-walkthrough.
+完整配置说明见下面的 [配置](#配置) 小节。
 
-### Run
+### 运行
 
 ```bash
 ./amp-proxy --config config.yaml
 ```
 
-Point Amp CLI at it:
+把 Amp CLI 指向 amp-proxy：
 
 ```bash
 export AMP_URL=http://127.0.0.1:8317
-export AMP_API_KEY=<the api-key from your config.yaml>
+export AMP_API_KEY=<config.yaml 里的 api-key>
 amp
 ```
 
-On Windows, use `scripts/restart.ps1` — it kills any stale
-`amp-proxy.exe` and relaunches the server with stdout+stderr redirected
-to `run.log`.
+Windows 用户用 `scripts/restart.ps1` —— 它会干掉残留的 `amp-proxy.exe`
+并重启服务，把 stdout + stderr 都重定向到 `run.log`。
 
 ---
 
-## Configuration
+## 配置
 
-Everything lives in one YAML file. A minimal working configuration:
+一切都在一个 YAML 文件里。最小可用配置：
 
 ```yaml
 host: "127.0.0.1"
@@ -145,7 +135,7 @@ api-keys:
 
 ampcode:
   upstream-url: "https://ampcode.com"
-  upstream-api-key: ""          # your Amp session token, or empty
+  upstream-api-key: ""          # Amp session token，空也行
 
   model-mappings:
     - from: "claude-opus-4-6"
@@ -164,42 +154,41 @@ ampcode:
   gemini-route-mode: "translate"
 ```
 
-### Routing decision order
+### 路由决策顺序
 
-| Step | Check | Action |
+| 步骤 | 判断 | 动作 |
 |---|---|---|
-| 1 | Extract `model` from body or URL path | — |
-| 2 | `force-model-mappings` + `model-mappings` match | Rewrite `model` in place |
-| 3 | Rewritten model listed in any `custom-providers[*].models` | Forward to that gateway with Bearer auth |
-| 4 | Google v1beta path + `gemini-route-mode: translate` | Run the Gemini translator before forwarding |
-| 5 | Nothing claimed the request | Fall through to `upstream-url` (ampcode.com) |
+| 1 | 从 body 或 URL 路径中提取 `model` | — |
+| 2 | `force-model-mappings` + `model-mappings` 命中 | 就地改写 `model` |
+| 3 | 改写后的 model 出现在某 `custom-providers[*].models` | 用 Bearer 认证转发到对应网关 |
+| 4 | Google v1beta 路径 + `gemini-route-mode: translate` | 先跑 Gemini 翻译器再转发 |
+| 5 | 以上都不命中 | 兜底走 `upstream-url`（ampcode.com） |
 
 ### `gemini-route-mode`
 
-Amp CLI's `finder` subagent issues Google `v1beta1 generateContent`
-requests, which most OpenAI-compatible gateways don't speak.
+Amp CLI 的 `finder` 子 agent 会发 Google `v1beta1 generateContent` 请求，
+大多数 OpenAI 兼容网关不认识这种格式。
 
-| Value | Behaviour |
+| 值 | 行为 |
 |---|---|
-| `ampcode` (default) | Falls through to `ampcode.com`. Guaranteed protocol fidelity, consumes Amp credits. |
-| `translate` | amp-proxy rewrites the Gemini body into an OpenAI Responses API call, forwards it to the matched custom provider, and translates the reply back into Gemini JSON before `finder` reads it. Saves credits; synthesised `call_id`s and a dropped `thoughtSignature` are the only semantic losses. |
+| `ampcode`（默认） | 兜底走 `ampcode.com`，协议保真，消耗 Amp credits |
+| `translate` | amp-proxy 把 Gemini 请求翻译成 OpenAI Responses 发到已匹配的 custom-provider，然后把响应翻译回 Gemini JSON 再交给 `finder`。节省 credits；代价是会合成 `call_id` 并丢弃 `thoughtSignature`，是唯二的语义损耗 |
 
-### Authentication model
+### 认证模型
 
-**amp-proxy only supports URL + Bearer token for custom providers.** There
-is no OAuth login flow for ChatGPT / Claude Code / Gemini CLI — those were
-deliberately excluded during the extraction from upstream CLIProxyAPI.
+**custom-provider 只支持 URL + Bearer token**。没有 ChatGPT / Claude Code /
+Gemini CLI 的 OAuth 登录流程 —— 这些在从上游 CLIProxyAPI 抽取时被有意砍掉了。
 
-If you need OAuth, run a separate local gateway (CLIProxyAPI itself, or
-any OpenAI-compat bridge) that terminates the OAuth flow and exposes a
-plain bearer endpoint, then point a `custom-providers` entry at it. This
-keeps amp-proxy small and protocol-focused.
+如果你需要 OAuth，在本地另跑一个网关（CLIProxyAPI 本身就可以，或任何
+OpenAI 兼容的桥接器），让它处理 OAuth 流程并对外暴露一个普通的 bearer
+endpoint，再把一个 `custom-providers` 条目指向它。这样 amp-proxy 能保持
+小巧和协议专注。
 
 ---
 
-## Development
+## 开发
 
-### Tests
+### 测试
 
 ```bash
 go build ./...
@@ -207,41 +196,36 @@ go vet  ./...
 go test -count=1 ./internal/customproxy/...
 ```
 
-The `customproxy` package ships an `httptest`-backed integration test
-that exercises the full Gemini translate chain end-to-end (request
-translation, fake augment SSE, response translation). A live smoke test
-against a running amp-proxy instance is available as a Node.js script:
+`customproxy` 包带了一个基于 `httptest` 的集成测试，会端到端跑完整的
+Gemini 翻译链路（请求翻译 → 假 augment SSE → 响应翻译）。如果你需要对
+一个真实跑着的 amp-proxy 实例做冒烟测试，可以直接跑这个 Node.js 脚本：
 
 ```bash
 node scripts/test_gemini_translate.js
 ```
 
-Set `AMP_PROXY_URL` / `AMP_PROXY_KEY` to target a non-default instance.
+用 `AMP_PROXY_URL` / `AMP_PROXY_KEY` 环境变量指定非默认实例。
 
-### Debug capture
+### Debug 抓包
 
-Set `debug.capture-path-substring` in `config.yaml` to have amp-proxy
-write raw request/response bodies for matching URL paths into
-`./capture/*.log`. Intended for local development — bodies contain
-prompts and tool calls, do not leave it on in production.
+在 `config.yaml` 里设 `debug.capture-path-substring`，amp-proxy 会把所有
+匹配的 URL 请求和响应原文写到 `./capture/*.log`。仅用于本地开发 ——
+里面有 prompts 和 tool calls，生产环境别开。
 
-### Divergence tracking
+### Upstream 分歧追踪
 
-[NOTICE.md](NOTICE.md) lists every file that diverges from the upstream
-CLIProxyAPI baseline, with a short rationale for each change. Keep it
-updated when you cherry-pick from upstream or fork-forward.
+[NOTICE.md](NOTICE.md) 列出了每个相对上游 CLIProxyAPI 有分歧的文件以及
+原因。从上游 cherry-pick 或 fork-forward 时记得同步更新。
 
 ---
 
-## Acknowledgments
+## 致谢
 
-amp-proxy is a derivative of
-[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) by the
-`router-for-me` team, used and extended under the MIT license. The
-original codebase does most of the heavy lifting — amp-proxy only carves
-out the Amp subsystem and adds the `customproxy` routing layer plus a
-handful of fixes. See [NOTICE.md](NOTICE.md) for the full attribution.
+amp-proxy 是 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
+（`router-for-me` 团队开发）的衍生作品，在 MIT 许可下使用和扩展。原始
+代码库承担了绝大部分工作 —— amp-proxy 只是把 Amp 子系统拆出来，再加上
+`customproxy` 路由层和几个修复。完整归属见 [NOTICE.md](NOTICE.md)。
 
 ## License
 
-[MIT](LICENSE), inherited from upstream.
+[MIT](LICENSE)，继承自上游。
