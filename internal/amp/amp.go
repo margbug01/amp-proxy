@@ -11,7 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/margbug01/amp-proxy/internal/modules"
 	"github.com/margbug01/amp-proxy/internal/config"
-	sdkaccess "github.com/margbug01/amp-proxy/sdk/access"
+	sdkaccess "github.com/margbug01/amp-proxy/internal/access"
 	log "github.com/sirupsen/logrus"
 )
 

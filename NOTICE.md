@@ -5,9 +5,9 @@ adapted from:
 
 - **CLIProxyAPI** — <https://github.com/router-for-me/CLIProxyAPI>
   - License: MIT
-  - The `internal/amp/` package and several helpers under `internal/` and
-    `sdk/` are derived from CLIProxyAPI's `internal/api/modules/amp/` and
-    adjacent subtrees. Each derived file carries a `// Derived from <path>@<commit>`
+  - The `internal/amp/` package and several helpers under `internal/` are
+    derived from CLIProxyAPI's `internal/api/modules/amp/` and adjacent
+    subtrees. Each derived file carries a `// Derived from <path>@<commit>`
     comment at the top for provenance tracking.
 
 The upstream `LICENSE` file is preserved at the repository root under `LICENSE`.
@@ -113,6 +113,17 @@ file (and approximate line range where relevant) together with a short reason.
     translator in `internal/customproxy/gemini_translator.go`. Field is
     read via `AmpModule.geminiRouteMode()` so it is hot-reloadable with
     the rest of the Amp config surface.
+
+- `internal/access/` (moved from `sdk/access/`)
+  - **Reason:** Upstream keeps its access-manager types under `sdk/access/`
+    because the SDK is meant to be consumable by external integrators.
+    amp-proxy has no external consumers — all code lives behind
+    `internal/` — so the `sdk/` root directory was just an extra level
+    of nesting. Files are imported as `sdkaccess
+    "github.com/margbug01/amp-proxy/internal/access"` in three places
+    (`internal/amp/amp.go`, `internal/amp/amp_test.go`,
+    `internal/server/server.go`). No API changes, import alias kept as
+    `sdkaccess` so future cherry-picks from upstream stay diff-friendly.
 
 - `internal/customproxy/` (entire package, ~1200 lines)
   - **Reason:** Non-upstream. New package that routes Amp requests to

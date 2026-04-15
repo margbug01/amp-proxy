@@ -19,7 +19,7 @@ import (
 	"github.com/margbug01/amp-proxy/internal/customproxy"
 	"github.com/margbug01/amp-proxy/internal/handlers"
 	"github.com/margbug01/amp-proxy/internal/modules"
-	sdkaccess "github.com/margbug01/amp-proxy/sdk/access"
+	sdkaccess "github.com/margbug01/amp-proxy/internal/access"
 )
 
 // Server owns the HTTP server, the Gin engine, and the amp module instance.
