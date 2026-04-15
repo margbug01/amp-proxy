@@ -1,0 +1,42 @@
+# Binaries
+/amp-proxy
+/amp-proxy.exe
+/amp-proxy.exe~
+/bin/
+/dist/
+
+# Local debug capture (see internal/server/body_capture.go)
+/capture/
+
+# Local config (may contain API keys)
+/config.yaml
+/config.local.yaml
+*.local.yaml
+
+# Go build artifacts
+*.test
+*.out
+/vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# OS
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+/logs/
+
+# Cookies / credentials
+cookies.txt
+.amp/
+*.pem
+*.key
+
+# OS-specific
+$RECYCLE.BIN/

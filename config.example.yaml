@@ -1,0 +1,35 @@
+# amp-proxy configuration example
+
+# HTTP server bind address
+host: "127.0.0.1"
+port: 8787
+
+# API keys that local clients must present to the proxy
+# (this is the LOCAL proxy auth, NOT the Amp upstream API key)
+api-keys:
+  - "change-me-local-key"
+
+# Sourcegraph Amp upstream configuration
+ampcode:
+  # Base URL of the Amp control plane
+  upstream-url: "https://ampcode.com"
+
+  # Default API key forwarded to ampcode.com (or empty to use per-client keys)
+  upstream-api-key: ""
+
+  # Per-client upstream API key routing (optional)
+  # Incoming clients can be mapped to different upstream keys
+  upstream-api-keys: []
+
+  # Restrict /api/internal, /api/user, /api/auth, /threads, /docs, /settings
+  # and root-level auth routes to localhost connections only
+  restrict-management-to-localhost: true
+
+  # Model mappings — rewrite the "model" field in requests before forwarding
+  model-mappings: []
+    # - from: "gpt-5-nano"
+    #   to: "claude-sonnet-4-5"
+    #   regex: false
+
+  # If true, model mappings take precedence over local providers
+  force-model-mappings: false
