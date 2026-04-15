@@ -13,14 +13,18 @@
 package customproxy
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 
 	"github.com/margbug01/amp-proxy/internal/config"
 )
@@ -29,6 +33,16 @@ import (
 // we should feed through sseRewriter.
 func isEventStream(ct string) bool {
 	return strings.Contains(strings.ToLower(ct), "text/event-stream")
+}
+
+// isJSONResponsesPath reports whether the request is an OpenAI Responses
+// API call that would normally return either SSE or a single JSON body.
+// Used by ModifyResponse to gate the non-streaming inspection branch.
+func isJSONResponsesPath(req *http.Request) bool {
+	if req == nil || req.URL == nil {
+		return false
+	}
+	return strings.Contains(req.URL.Path, "/v1/responses") || strings.HasSuffix(req.URL.Path, "/responses")
 }
 
 // Provider represents a single configured upstream endpoint plus its
@@ -233,9 +247,39 @@ func buildProxy(rawURL, apiKey string) (*httputil.ReverseProxy, error) {
 				resp.Header.Del("Content-Length")
 				resp.ContentLength = -1
 				resp.Body = newSSERewriter(resp.Body)
+			} else if isJSONResponsesPath(resp.Request) && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "application/json") {
+				// Non-streaming /v1/responses branch: read up to maxInspect
+				// bytes, check for the "empty output array despite completion
+				// tokens" anomaly, and restore the body untouched. We do not
+				// rewrite here because there is no item.done stream to
+				// accumulate for a single JSON reply.
+				const maxInspect = 10 * 1024 * 1024
+				buf, err := io.ReadAll(io.LimitReader(resp.Body, maxInspect))
+				if err != nil {
+					return err
+				}
+				_ = resp.Body.Close()
+				resp.Body = io.NopCloser(bytes.NewReader(buf))
+				resp.ContentLength = int64(len(buf))
+
+				outputLen := 0
+				if arr := gjson.GetBytes(buf, "output"); arr.IsArray() {
+					outputLen = len(arr.Array())
+				}
+				outputTokens := gjson.GetBytes(buf, "usage.output_tokens").Int()
+				if outputLen == 0 && outputTokens > 0 {
+					log.WithFields(log.Fields{
+						"path":          resp.Request.URL.Path,
+						"output_tokens": outputTokens,
+					}).Warn("customproxy: non-streaming /v1/responses returned empty output array despite completion tokens; client may not render the message correctly. Consider stream: true")
+				}
 			}
 			return nil
 		},
+	}
+	proxy.Transport = &retryingTransport{
+		base:  http.DefaultTransport,
+		delay: 250 * time.Millisecond,
 	}
 	return proxy, nil
 }
