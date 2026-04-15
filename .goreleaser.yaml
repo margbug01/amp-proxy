@@ -1,0 +1,95 @@
+# GoReleaser v2 configuration for amp-proxy.
+# Run locally with: goreleaser release --snapshot --clean
+# Production releases are fired by .github/workflows/release.yml when a
+# tag matching v* is pushed.
+version: 2
+
+project_name: amp-proxy
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: amp-proxy
+    main: ./cmd/amp-proxy
+    binary: amp-proxy
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .ShortCommit }}
+      - -X main.date={{ .Date }}
+
+archives:
+  - id: amp-proxy
+    ids:
+      - amp-proxy
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - NOTICE.md
+      - README.md
+      - README_en.md
+      - config.example.yaml
+      - scripts/restart.ps1
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "typo"
+      - "Merge pull request"
+  groups:
+    - title: Features
+      regexp: '^.*?(feat|add)(\(.+\))??!?:.+$'
+      order: 0
+    - title: Bug fixes
+      regexp: '^.*?(fix|bug)(\(.+\))??!?:.+$'
+      order: 1
+    - title: Refactors
+      regexp: '^.*?(refactor|chore|style)(\(.+\))??!?:.+$'
+      order: 2
+    - title: Others
+      order: 999
+
+release:
+  draft: false
+  prerelease: auto
+  header: |
+    ## amp-proxy {{ .Tag }}
+
+    Focused reverse proxy for the Sourcegraph Amp CLI. See the
+    [README](https://github.com/margbug01/amp-proxy/blob/main/README.md)
+    for setup and a walkthrough of the routing model.
+
+    **Downloads below** cover macOS (Intel + Apple Silicon), Linux
+    (x86_64 + arm64) and Windows (x86_64 + arm64). All archives ship
+    with the binary, `LICENSE`, `NOTICE.md`, both READMEs, and
+    `config.example.yaml`.
+  footer: |
+    ---
+    Verify downloads against `checksums.txt`. Built with Go from
+    `go.mod`'s toolchain directive.
