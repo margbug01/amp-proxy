@@ -93,7 +93,18 @@ cd amp-proxy
 go build -o amp-proxy .
 ```
 
-### Configure
+### Configure — the fast path: `init`
+
+```bash
+./amp-proxy init
+```
+
+Answer two questions (gateway URL, gateway Bearer token) and a ready-to-
+run `config.yaml` is written for you — complete with a randomly
+generated local API key, the full 9-entry Amp CLI model mapping table,
+and sensible defaults. Skip straight to **Run** below.
+
+If you'd rather hand-edit:
 
 ```bash
 cp config.example.yaml config.yaml

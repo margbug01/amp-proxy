@@ -6,6 +6,23 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-04-16
+
+### Added
+
+- **`amp-proxy init` subcommand** — interactive wizard that prompts for
+  the custom provider URL and Bearer token, generates a random local
+  API key, and writes a complete ready-to-run `config.yaml`. The full
+  9-entry Amp CLI model mapping table, `force-model-mappings: true`,
+  `gemini-route-mode: "translate"`, and localhost-only management are
+  baked into the generated file so operators only have to answer two
+  questions to get a working proxy. Pass `-force` to overwrite an
+  existing config and `-config <path>` to write to a non-default path.
+- **README bilingual quickstart update** — both READMEs now lead with
+  `amp-proxy init` as the recommended first-run flow, with the manual
+  `config.example.yaml` path kept below for operators who prefer to
+  hand-edit YAML.
+
 ## [0.1.0] - 2026-04-16
 
 First tagged release. Binaries for macOS (Intel + Apple Silicon), Linux
@@ -106,5 +123,6 @@ release; grab the archive matching your platform and see the
   run a separate bridge that terminates the OAuth flow and exposes a
   plain Bearer endpoint, then point a `custom-providers` entry at it.
 
-[Unreleased]: https://github.com/margbug01/amp-proxy/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/margbug01/amp-proxy/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/margbug01/amp-proxy/releases/tag/v0.1.1
 [0.1.0]: https://github.com/margbug01/amp-proxy/releases/tag/v0.1.0

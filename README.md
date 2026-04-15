@@ -86,7 +86,17 @@ cd amp-proxy
 go build -o amp-proxy .
 ```
 
-### 配置
+### 配置（推荐走 `init` 向导）
+
+```bash
+./amp-proxy init
+```
+
+回答两个问题——网关 URL 和 Bearer token——`config.yaml` 就写好了，
+里面包含随机生成的本地 API key、完整的 9 条 Amp 模型映射表、合理的
+默认值。直接跳到下面的"运行"一节即可。
+
+如果更想手工编辑：
 
 ```bash
 cp config.example.yaml config.yaml

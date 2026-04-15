@@ -26,6 +26,15 @@ var (
 )
 
 func main() {
+	// Subcommand dispatch. Keep this strictly ahead of flag.Parse so the
+	// subcommand's own flag set can own its argv slice.
+	if len(os.Args) > 1 && os.Args[1] == "init" {
+		if err := runInit(os.Args[2:]); err != nil {
+			log.Fatalf("init: %v", err)
+		}
+		return
+	}
+
 	configPath := flag.String("config", "config.yaml", "path to YAML config file")
 	showVersion := flag.Bool("version", false, "print version information and exit")
 	flag.Parse()
