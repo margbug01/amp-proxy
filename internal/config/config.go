@@ -26,6 +26,25 @@ type Config struct {
 	// AmpCode contains Amp upstream configuration, management restrictions,
 	// and model mappings.
 	AmpCode AmpCode `yaml:"ampcode" json:"ampcode"`
+
+	// Debug groups optional development-only middlewares. All fields default
+	// to the zero value (everything off).
+	Debug DebugConfig `yaml:"debug,omitempty" json:"debug,omitempty"`
+}
+
+// DebugConfig enables optional development-only middlewares.
+// All fields default to the zero value (everything off).
+type DebugConfig struct {
+	// CapturePathSubstring, when non-empty, enables bodyCapture middleware
+	// on every request whose URL path contains the substring. The captured
+	// request and response bodies (up to 2 MiB each) are written under
+	// CaptureDir, one file per request. Leave empty in production.
+	CapturePathSubstring string `yaml:"capture-path-substring,omitempty" json:"capture-path-substring,omitempty"`
+
+	// CaptureDir is the directory for bodyCapture output. Defaults to
+	// "./capture" relative to the server working directory when unset and
+	// CapturePathSubstring is non-empty.
+	CaptureDir string `yaml:"capture-dir,omitempty" json:"capture-dir,omitempty"`
 }
 
 // AmpModelMapping defines a model name mapping for Amp CLI requests.

@@ -67,7 +67,9 @@ func logAmpRouting(routeType AmpRouteType, requestedModel, resolvedModel, provid
 		fields["cost"] = "amp_credits"
 		fields["source"] = "ampcode.com"
 		fields["model_id"] = requestedModel // Explicit model_id for easy config reference
-		log.WithFields(fields).Warnf("forwarding to ampcode.com (uses amp credits) - model_id: %s | To use local provider, add to config: ampcode.model-mappings: [{from: \"%s\", to: \"<your-local-model>\"}]", requestedModel, requestedModel)
+		// Error-level: for an amp-proxy operator this is a billable event and
+		// typically means the model leaked past the routing table.
+		log.WithFields(fields).Errorf("amp-proxy: unmapped model %q — forwarding to ampcode.com (billable). Add this model to ampcode.custom-providers.models or ampcode.model-mappings to route it elsewhere.", requestedModel)
 
 	case RouteTypeNoProvider:
 		fields["cost"] = "none"

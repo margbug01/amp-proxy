@@ -33,3 +33,11 @@ ampcode:
 
   # If true, model mappings take precedence over local providers
   force-model-mappings: false
+
+# Debug-only: capture request and response bodies to disk for any URL path
+# containing the given substring. Leave empty in production — bodies may
+# include prompts, tool calls, and other sensitive context.
+#
+# debug:
+#   capture-path-substring: "/v1/responses"
+#   capture-dir: "./capture"

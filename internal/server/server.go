@@ -47,7 +47,19 @@ func New(cfg *config.Config) (*Server, error) {
 
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
-	engine.Use(gin.Recovery(), accessLog(), bodyCapture("F:/AA/amp-proxy/capture", "/v1/responses"))
+	engine.Use(gin.Recovery(), accessLog())
+
+	// Opt-in bodyCapture middleware. Only registered when cfg.Debug has
+	// a non-empty path substring; leave empty in production to avoid
+	// persisting potentially sensitive prompt/response bodies to disk.
+	if sub := cfg.Debug.CapturePathSubstring; sub != "" {
+		dir := cfg.Debug.CaptureDir
+		if dir == "" {
+			dir = "./capture"
+		}
+		log.Infof("bodyCapture enabled path=%s dir=%s", sub, dir)
+		engine.Use(bodyCapture(dir, sub))
+	}
 
 	engine.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
