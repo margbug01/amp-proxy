@@ -110,6 +110,19 @@ func (m *AmpModule) forceModelMappings() bool {
 	return m.lastConfig.ForceModelMappings
 }
 
+// geminiRouteMode returns the active ampcode.gemini-route-mode config value.
+// The FallbackHandler uses this closure to decide whether Google native
+// paths are translated into OpenAI Responses requests or forwarded to the
+// ampcode.com proxy. Hot-reload safe: reads from lastConfig under the mutex.
+func (m *AmpModule) geminiRouteMode() string {
+	m.configMu.RLock()
+	defer m.configMu.RUnlock()
+	if m.lastConfig == nil {
+		return ""
+	}
+	return m.lastConfig.GeminiRouteMode
+}
+
 // Register sets up Amp routes if configured.
 // This implements the RouteModuleV2 interface with Context.
 // Routes are registered only once via sync.Once for idempotent behavior.

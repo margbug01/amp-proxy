@@ -85,6 +85,12 @@ type FallbackHandler struct {
 	getProxy           func() *httputil.ReverseProxy
 	modelMapper        ModelMapper
 	forceModelMappings func() bool
+	// geminiRouteMode returns the current ampcode.gemini-route-mode config
+	// value. Empty string or "ampcode" preserves the upstream-compatible
+	// behavior (fall through to ampcode.com for Google native paths).
+	// "translate" asks WrapHandler to rewrite Gemini requests into OpenAI
+	// Responses shape before forwarding to the matched custom provider.
+	geminiRouteMode func() string
 }
 
 // NewFallbackHandler creates a new fallback handler wrapper
@@ -93,6 +99,7 @@ func NewFallbackHandler(getProxy func() *httputil.ReverseProxy) *FallbackHandler
 	return &FallbackHandler{
 		getProxy:           getProxy,
 		forceModelMappings: func() bool { return false },
+		geminiRouteMode:    func() string { return "" },
 	}
 }
 
@@ -105,7 +112,20 @@ func NewFallbackHandlerWithMapper(getProxy func() *httputil.ReverseProxy, mapper
 		getProxy:           getProxy,
 		modelMapper:        mapper,
 		forceModelMappings: forceModelMappings,
+		geminiRouteMode:    func() string { return "" },
 	}
+}
+
+// SetGeminiRouteMode installs a hot-reloadable getter that decides whether
+// Google native paths translate into OpenAI Responses requests or fall
+// through to the ampcode.com proxy. A nil getter restores the default
+// behaviour (empty string, equivalent to "ampcode").
+func (fh *FallbackHandler) SetGeminiRouteMode(getter func() string) {
+	if getter == nil {
+		fh.geminiRouteMode = func() string { return "" }
+		return
+	}
+	fh.geminiRouteMode = getter
 }
 
 // SetModelMapper sets the model mapper for this handler (allows late binding)
@@ -233,23 +253,47 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 		// ampcode.com fallback. The Director in customproxy rewrites the
 		// path and swaps the Authorization header to the provider's key.
 		//
-		// Exception: Google v1beta / v1beta1 native paths
-		// (:generateContent, :streamGenerateContent). Custom providers like
-		// augment speak OpenAI Responses and Anthropic Messages, not the
-		// Google generateContent shape, so forwarding a Gemini model
-		// mapping there would 404. For these paths, skip customproxy AND
-		// skip the mapping handler chain (which would otherwise dispatch to
-		// the geminiBridge stub that returns 501) — go straight to the
-		// ampcode.com proxy, which knows how to talk to the real Google
-		// endpoint. Gemini requests carry the model name in the URL path,
-		// not the body, so rewriteModelInRequest was a no-op and bodyBytes
+		// Google v1beta / v1beta1 native paths (:generateContent,
+		// :streamGenerateContent) have two possible behaviours, selected
+		// by ampcode.gemini-route-mode in config:
+		//
+		//   "" / "ampcode" (default): fall through to the ampcode.com
+		//       proxy so the real Google backend services the request.
+		//       This preserves strict protocol fidelity at the cost of
+		//       consuming Amp credits.
+		//
+		//   "translate": rewrite the Gemini generateContent body into an
+		//       OpenAI Responses API body, retarget the request at
+		//       /v1/responses, tag the context so ModifyResponse can flip
+		//       the reply back into Gemini shape, then let the customproxy
+		//       ReverseProxy forward to the matched custom provider. No
+		//       Amp credits are consumed, at the cost of minor parity loss
+		//       (no thoughtSignature, synthesised call ids).
+		//
+		// Gemini requests carry the model name in the URL path rather than
+		// the body, so rewriteModelInRequest was a no-op and bodyBytes
 		// still contains the original request unchanged.
 		customProxy := customproxy.GetGlobal().ProxyForModel(resolvedModel)
 		if customProxy != nil && isGoogleNativePath(c.Request.URL.Path) {
+			mode := ""
+			if fh.geminiRouteMode != nil {
+				mode = strings.ToLower(strings.TrimSpace(fh.geminiRouteMode()))
+			}
+
+			if mode == "translate" {
+				if handled := fh.serveGeminiTranslate(c, customProxy, bodyBytes, modelName, resolvedModel, requestPath); handled {
+					return
+				}
+				// Translator refused (only :streamGenerateContent or
+				// translator error). Fall through to the ampcode.com
+				// fallback below so Amp CLI still sees a usable reply.
+			}
+
 			log.WithFields(log.Fields{
 				"model": resolvedModel,
 				"path":  c.Request.URL.Path,
-			}).Warn("amp fallback: customproxy skipped for Google v1beta path (format incompatible); forwarding directly to ampcode.com")
+				"mode":  mode,
+			}).Warn("amp fallback: customproxy skipped for Google v1beta path (format incompatible or translate mode off); forwarding directly to ampcode.com")
 			if proxy := fh.getProxy(); proxy != nil {
 				logAmpRouting(RouteTypeAmpCredits, modelName, "", "", requestPath)
 				c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
@@ -333,6 +377,74 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 			handler(c)
 		}
 	}
+}
+
+// serveGeminiTranslate rewrites a Google v1beta / v1beta1 generateContent
+// request into an OpenAI Responses API request and forwards it through the
+// supplied customproxy ReverseProxy. It returns true when the request was
+// fully handled (response already written to c.Writer) and false when the
+// caller should fall through to a different code path — either because the
+// request uses :streamGenerateContent (not supported in the initial
+// translate implementation) or because translation failed.
+//
+// The customproxy ModifyResponse hook observes the context tag installed
+// here and translates augment's OpenAI Responses SSE reply back into a
+// Gemini generateContent JSON body before the downstream client reads it.
+func (fh *FallbackHandler) serveGeminiTranslate(c *gin.Context, customProxy *httputil.ReverseProxy, bodyBytes []byte, requestedModel, resolvedModel, requestPath string) bool {
+	// Streaming Gemini replies need a matching event stream on the wire;
+	// the initial translator only emits non-streaming JSON, so bail out
+	// and let the caller fall through to the ampcode.com fallback.
+	if strings.HasSuffix(c.Request.URL.Path, ":streamGenerateContent") {
+		log.WithFields(log.Fields{
+			"model": resolvedModel,
+			"path":  c.Request.URL.Path,
+		}).Warn("gemini-translate: streamGenerateContent not yet supported; falling through to ampcode.com")
+		return false
+	}
+	if !strings.HasSuffix(c.Request.URL.Path, ":generateContent") {
+		return false
+	}
+
+	newBody, err := customproxy.TranslateGeminiRequestToOpenAI(bodyBytes, resolvedModel)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"model": resolvedModel,
+			"path":  c.Request.URL.Path,
+			"err":   err,
+		}).Warn("gemini-translate: request translation failed; falling through to ampcode.com")
+		return false
+	}
+
+	// Rewrite the request so customproxy's Director forwards it to the
+	// OpenAI Responses endpoint. The Director's extractLeaf helper strips a
+	// leading /v1 prefix and reappends it from the custom provider's base
+	// path, so setting URL.Path to "/v1/responses" is idempotent.
+	c.Request.URL.Path = "/v1/responses"
+	c.Request.URL.RawPath = ""
+	c.Request.Body = io.NopCloser(bytes.NewReader(newBody))
+	c.Request.ContentLength = int64(len(newBody))
+	c.Request.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("Accept", "text/event-stream")
+	// The Google API client header only makes sense at the Google backend
+	// and may confuse augment; drop it so the forwarded request looks like
+	// a plain OpenAI Responses call.
+	c.Request.Header.Del("X-Goog-Api-Client")
+	c.Request.Header.Del("X-Goog-Api-Key")
+
+	ctx := customproxy.WithGeminiTranslate(c.Request.Context(), requestedModel)
+	c.Request = c.Request.WithContext(ctx)
+
+	logAmpRouting(RouteTypeLocalProvider, requestedModel, resolvedModel, "custom-gemini-translate", requestPath)
+	log.WithFields(log.Fields{
+		"gemini_model":   requestedModel,
+		"resolved_model": resolvedModel,
+		"new_path":       c.Request.URL.Path,
+		"new_body_bytes": len(newBody),
+	}).Info("gemini-translate: forwarding rewritten request to customproxy")
+
+	customProxy.ServeHTTP(c.Writer, c.Request)
+	return true
 }
 
 // filterAntropicBetaHeader filters Anthropic-Beta header to remove features requiring special subscription

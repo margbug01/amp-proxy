@@ -35,6 +35,13 @@ file (and approximate line range where relevant) together with a short reason.
     `settingsCopy := settings; m.lastConfig = &settingsCopy` so the package
     still builds under Go 1.23+.
 
+- `internal/amp/amp.go` (`AmpModule.geminiRouteMode`)
+  - **Reason:** New method returning `AmpCode.GeminiRouteMode` under the
+    module's config mutex. Passed into `FallbackHandler.SetGeminiRouteMode`
+    by `routes.go` so the Gemini translate branch reads a hot-reloadable
+    view of the config. Analogous to the pre-existing `forceModelMappings`
+    accessor.
+
 - `internal/amp/fallback_handlers.go` (imports, lines 1–18)
   - **Reason:** New imports `github.com/margbug01/amp-proxy/internal/customproxy`
     and `"strconv"` support the custom-provider routing hook and the
@@ -59,6 +66,27 @@ file (and approximate line range where relevant) together with a short reason.
     custom provider would be forwarded to an endpoint that 404s on the
     Google path, breaking Amp CLI's `finder` subagent.
 
+- `internal/amp/fallback_handlers.go` (Gemini translate branch + `serveGeminiTranslate`)
+  - **Reason:** When `ampcode.gemini-route-mode` is set to `"translate"`,
+    the Google native path branch no longer unconditionally falls through
+    to ampcode.com. Instead `serveGeminiTranslate` rewrites the incoming
+    Gemini v1beta1 `generateContent` body into an OpenAI Responses API
+    request via `customproxy.TranslateGeminiRequestToOpenAI`, retargets
+    the request URL to `/v1/responses`, tags the request context with
+    `customproxy.WithGeminiTranslate`, and lets the custom provider
+    ReverseProxy deliver the reply. The ModifyResponse hook on the
+    customproxy side reads the tag and translates the upstream OpenAI
+    Responses SSE stream back into a Gemini `generateContent` JSON body
+    before the downstream Amp CLI consumer reads it. `:streamGenerateContent`
+    and translator-error paths still fall through to the ampcode.com
+    fallback, preserving the prior behaviour from commit `061e0f7`.
+
+- `internal/amp/fallback_handlers.go` (`SetGeminiRouteMode`, `FallbackHandler.geminiRouteMode` field)
+  - **Reason:** New hot-reloadable getter injected by `routes.go` so
+    `WrapHandler` can read the active `gemini-route-mode` string from
+    `AmpCode` config without taking a dependency on the `config` package.
+    Mirrors the existing `forceModelMappings` closure pattern.
+
 - `internal/amp/fallback_handlers.go` (`WrapHandler`, lines 239–241)
   - **Reason:** Realigns `c.Request.ContentLength` and the `Content-Length`
     header with the rewritten body length before `customProxy.ServeHTTP`.
@@ -72,7 +100,21 @@ file (and approximate line range where relevant) together with a short reason.
     a billable event that indicates a routing-table miss and deserves an
     error-level signal in the run log.
 
-- `internal/customproxy/` (entire package, ~700 lines)
+- `internal/amp/routes.go` (`SetGeminiRouteMode` calls)
+  - **Reason:** Two new call sites — one inside `registerProviderAliases`
+    and one inside the Google v1beta1 route registration — wire the
+    module's `geminiRouteMode` accessor into both `FallbackHandler`
+    instances so the translate branch can read the active config.
+
+- `internal/config/config.go` (`AmpCode.GeminiRouteMode`)
+  - **Reason:** New optional field with YAML key `gemini-route-mode`.
+    Empty string or `"ampcode"` preserves the existing divert-to-ampcode
+    behaviour; `"translate"` activates the Gemini↔OpenAI Responses
+    translator in `internal/customproxy/gemini_translator.go`. Field is
+    read via `AmpModule.geminiRouteMode()` so it is hot-reloadable with
+    the rest of the Amp config surface.
+
+- `internal/customproxy/` (entire package, ~1200 lines)
   - **Reason:** Non-upstream. New package that routes Amp requests to
     third-party endpoints keyed by model name. Includes:
     - An SSE rewriter (`sse_rewriter.go`) that augments non-compliant
@@ -94,6 +136,21 @@ file (and approximate line range where relevant) together with a short reason.
       whose `content:[]` is empty despite non-zero `usage.output_tokens`.
       Kept as a safety net in case the stream-upgrade path is ever
       bypassed.
+    - A Gemini ↔ OpenAI Responses protocol translator
+      (`gemini_translator.go`): exports
+      `TranslateGeminiRequestToOpenAI` for the amp fallback handler and
+      a `WithGeminiTranslate` context helper. The private
+      `collapseResponsesSSEToGemini` and
+      `translateOpenAIResponsesJSONToGemini` helpers convert augment's
+      `/v1/responses` reply back into a Gemini `generateContent` JSON
+      body in `ModifyResponse`. Reasoning items are dropped, call ids
+      are synthesised so OpenAI's `function_call` / `function_call_output`
+      pairing has a key to work with, JSON schema type values are
+      lowercased from Gemini's uppercase form, and `thoughtSignature`
+      bytes are stripped because augment cannot verify them. The
+      ModifyResponse branch is gated on the context tag and runs before
+      the existing `/v1/messages` and `/v1/responses` branches so those
+      code paths stay untouched by the translator.
 
 - `internal/handlers/{claude,gemini,openai}/` (plus `handlers.go`)
   - **Reason:** Hand-written no-op stubs that replace upstream

@@ -98,6 +98,24 @@ type AmpCode struct {
 	// provider's URL instead of the ampcode.com upstream. This is how
 	// amp-proxy routes requests to third-party OpenAI-compatible endpoints.
 	CustomProviders []CustomProvider `yaml:"custom-providers,omitempty" json:"custom-providers,omitempty"`
+
+	// GeminiRouteMode controls how Google v1beta / v1beta1 generateContent
+	// requests are handled when their (mapped) model would otherwise land on
+	// a custom provider that only speaks OpenAI Responses / Anthropic Messages.
+	//
+	// Valid values:
+	//
+	//   ""          Default. Same behaviour as "ampcode".
+	//   "ampcode"   Fall through to the ampcode.com proxy so Amp CLI's
+	//               finder subagent hits the real Google Gemini backend
+	//               (consumes Amp credits but guarantees fidelity).
+	//   "translate" amp-proxy rewrites the Gemini request body into an
+	//               OpenAI Responses API request and forwards it to the
+	//               custom provider claiming the mapped model. The reply is
+	//               translated back into a Gemini generateContent JSON body
+	//               so Amp CLI never sees the shape change. Saves credits
+	//               at the cost of a small loss of parity (no thoughtSignature).
+	GeminiRouteMode string `yaml:"gemini-route-mode,omitempty" json:"gemini-route-mode,omitempty"`
 }
 
 // CustomProvider describes a single third-party upstream endpoint that

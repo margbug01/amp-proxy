@@ -317,6 +317,17 @@ func buildProxy(rawURL, apiKey string) (*httputil.ReverseProxy, error) {
 			_, _ = w.Write([]byte(`{"error":"customproxy: upstream request failed","detail":"` + err.Error() + `"}`))
 		},
 		ModifyResponse: func(resp *http.Response) error {
+			// Gemini translate: if the request context was tagged in
+			// fallback_handlers.go, collapse the upstream OpenAI Responses
+			// reply back into a Gemini generateContent JSON body before the
+			// downstream Amp CLI reads it. This branch MUST run before the
+			// /v1/messages and /v1/responses branches below because it
+			// rewrites the body shape entirely and must not be double-
+			// processed by sseRewriter or the empty-output warning paths.
+			if gt := geminiTranslateFromContext(resp.Request.Context()); gt != nil {
+				return translateGeminiResponse(resp, gt)
+			}
+
 			if isEventStream(resp.Header.Get("Content-Type")) {
 				// Upgraded /v1/messages: collapse the SSE stream we just
 				// asked augment for back into a single JSON body so the
