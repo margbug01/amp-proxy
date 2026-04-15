@@ -14,6 +14,8 @@ package customproxy
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,6 +30,47 @@ import (
 
 	"github.com/margbug01/amp-proxy/internal/config"
 )
+
+// upgradedMessagesKey tags a request whose /v1/messages body we rewrote
+// with "stream":true. ModifyResponse uses the tag to decide whether the
+// incoming SSE needs to be collapsed back into a single JSON body.
+type upgradedMessagesKey struct{}
+
+// upgradeMessagesToStream flips a non-streaming Anthropic Messages
+// request into a streaming one in-place. Returns (upgraded, newBody, err).
+// On upgraded=false newBody still restores the original bytes to req.Body
+// via the caller so the proxy can forward the request regardless of
+// upgrade decision.
+func upgradeMessagesToStream(req *http.Request) (bool, io.ReadCloser, error) {
+	const maxBody = 16 * 1024 * 1024
+	if req.Body == nil {
+		return false, http.NoBody, nil
+	}
+	raw, err := io.ReadAll(io.LimitReader(req.Body, maxBody))
+	_ = req.Body.Close()
+	if err != nil {
+		return false, io.NopCloser(bytes.NewReader(raw)), err
+	}
+	// If the client already asked for streaming, don't touch the body.
+	if gjson.GetBytes(raw, "stream").Bool() {
+		return false, io.NopCloser(bytes.NewReader(raw)), nil
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return false, io.NopCloser(bytes.NewReader(raw)), fmt.Errorf("parse request body: %w", err)
+	}
+	obj["stream"] = true
+	newBody, err := json.Marshal(obj)
+	if err != nil {
+		return false, io.NopCloser(bytes.NewReader(raw)), fmt.Errorf("marshal upgraded body: %w", err)
+	}
+	req.ContentLength = int64(len(newBody))
+	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(newBody)))
+	// Advertise SSE so the upstream picks its streaming representation
+	// even if it decides format from the Accept header.
+	req.Header.Set("Accept", "text/event-stream")
+	return true, io.NopCloser(bytes.NewReader(newBody)), nil
+}
 
 // isEventStream reports whether the given Content-Type is an SSE stream
 // we should feed through sseRewriter.
@@ -238,10 +281,33 @@ func buildProxy(rawURL, apiKey string) (*httputil.ReverseProxy, error) {
 			req.Header.Del("Anthropic-Beta")
 			req.Header.Del("anthropic-beta")
 
+			// Non-streaming /v1/messages content-loss workaround.
+			// augment silently drops assistant content in the
+			// non-streaming Anthropic Messages path but serves the
+			// streaming path correctly, so we flip stream:true here
+			// and collapse the SSE reply in ModifyResponse.
+			upgraded := false
+			if req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/messages") {
+				ok, newBody, err := upgradeMessagesToStream(req)
+				if err != nil {
+					log.Warnf("customproxy: upgrade /v1/messages to stream failed: %v", err)
+				}
+				// upgradeMessagesToStream always returns a fresh body
+				// reader, even on no-op paths, so we can swap it in
+				// unconditionally.
+				req.Body = newBody
+				if ok {
+					upgraded = true
+					ctx := context.WithValue(req.Context(), upgradedMessagesKey{}, true)
+					*req = *req.WithContext(ctx)
+				}
+			}
+
 			log.WithFields(log.Fields{
-				"method": req.Method,
-				"from":   originalPath,
-				"to":     target.Scheme + "://" + target.Host + req.URL.Path,
+				"method":   req.Method,
+				"from":     originalPath,
+				"to":       target.Scheme + "://" + target.Host + req.URL.Path,
+				"upgraded": upgraded,
 			}).Info("customproxy: forwarding")
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -252,9 +318,37 @@ func buildProxy(rawURL, apiKey string) (*httputil.ReverseProxy, error) {
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			if isEventStream(resp.Header.Get("Content-Type")) {
-				// Strip Content-Length because we may grow the response when
-				// we patch response.completed. Transport will fall back to
-				// chunked encoding.
+				// Upgraded /v1/messages: collapse the SSE stream we just
+				// asked augment for back into a single JSON body so the
+				// downstream client (which originally sent a non-streaming
+				// request) still receives the shape it expects.
+				if upgraded, _ := resp.Request.Context().Value(upgradedMessagesKey{}).(bool); upgraded {
+					collapsed, err := collapseMessagesSSE(resp.Body)
+					_ = resp.Body.Close()
+					if err != nil {
+						log.Errorf("customproxy: collapseMessagesSSE failed: %v", err)
+						// Fall back to an empty assistant envelope so the
+						// client still sees a well-formed reply. This is
+						// strictly no worse than today's broken baseline.
+						collapsed = []byte(`{"type":"message","role":"assistant","content":[],"stop_reason":"end_turn","usage":{"input_tokens":0,"output_tokens":0}}`)
+					}
+					resp.Body = io.NopCloser(bytes.NewReader(collapsed))
+					resp.ContentLength = int64(len(collapsed))
+					resp.Header.Set("Content-Type", "application/json")
+					resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(collapsed)))
+					resp.Header.Del("Transfer-Encoding")
+					return nil
+				}
+				// /v1/messages SSE that we did not upgrade (e.g. client
+				// explicitly asked for streaming): pass through untouched.
+				// sseRewriter targets the OpenAI Responses schema and
+				// would corrupt Anthropic Messages events.
+				if isJSONMessagesPath(resp.Request) {
+					return nil
+				}
+				// /v1/responses SSE: strip Content-Length because we may
+				// grow the response when we patch response.completed;
+				// transport will fall back to chunked encoding.
 				resp.Header.Del("Content-Length")
 				resp.ContentLength = -1
 				resp.Body = newSSERewriter(resp.Body)

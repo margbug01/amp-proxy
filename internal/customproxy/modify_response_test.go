@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 // captureLogrus redirects the standard logger to a buffer for the duration
@@ -111,6 +112,158 @@ func TestModifyResponse_WarnsOnAnthropicEmptyContent(t *testing.T) {
 	}
 	if !strings.Contains(logged, "gpt-5.4-mini-2026-03-17") {
 		t.Errorf("expected upstream model in log fields; got:\n%s", logged)
+	}
+}
+
+// TestModifyResponse_UpgradesAndCollapsesAnthropicMessages exercises the
+// full non-streaming-to-streaming upgrade path end-to-end:
+//  1. client sends a non-streaming POST /api/provider/anthropic/v1/messages
+//  2. customproxy's Director rewrites the body with "stream":true and sets
+//     Accept: text/event-stream
+//  3. the fake upstream sees the upgraded body, returns an Anthropic
+//     Messages SSE stream
+//  4. customproxy's ModifyResponse collapses the SSE into a single JSON
+//     assistant message that the client receives as if the upstream had
+//     replied non-streaming correctly
+func TestModifyResponse_UpgradesAndCollapsesAnthropicMessages(t *testing.T) {
+	// Canonical augment-style SSE fixture: single text block "Hello world".
+	const sseFixture = `event: message_start
+data: {"type":"message_start","message":{"id":"resp_e2e","type":"message","role":"assistant","model":"gpt-5.4-mini","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0},"content":[],"stop_reason":null}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello "}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":12,"output_tokens":5}}
+
+event: message_stop
+data: {"type":"message_stop"}
+`
+
+	var sawStreamTrue bool
+	var sawAcceptSSE bool
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/v1/messages") {
+			t.Errorf("upstream path: got %s, want .../v1/messages", r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		if strings.Contains(string(body), `"stream":true`) {
+			sawStreamTrue = true
+		}
+		if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+			sawAcceptSSE = true
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(sseFixture))
+	}))
+	defer upstream.Close()
+
+	proxy, err := buildProxy(upstream.URL+"/v1", "test-key")
+	if err != nil {
+		t.Fatalf("buildProxy: %v", err)
+	}
+	outer := httptest.NewServer(proxy)
+	defer outer.Close()
+
+	// Client sends a non-streaming request (no stream field).
+	clientBody := `{"model":"claude-sonnet-4-6","max_tokens":100,"messages":[{"role":"user","content":"say hi"}]}`
+	req, err := http.NewRequest(http.MethodPost, outer.URL+"/api/provider/anthropic/v1/messages", strings.NewReader(clientBody))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if !sawStreamTrue {
+		t.Errorf("upstream did not receive stream:true in body")
+	}
+	if !sawAcceptSSE {
+		t.Errorf("upstream did not receive Accept: text/event-stream")
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("client Content-Type: got %q, want application/json", ct)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+
+	// Validate reconstructed message.
+	if id := gjson.GetBytes(body, "id").String(); id != "resp_e2e" {
+		t.Errorf("id: got %q, want resp_e2e", id)
+	}
+	if text := gjson.GetBytes(body, "content.0.text").String(); text != "Hello world" {
+		t.Errorf("content[0].text: got %q, want %q\nraw: %s", text, "Hello world", body)
+	}
+	if reason := gjson.GetBytes(body, "stop_reason").String(); reason != "end_turn" {
+		t.Errorf("stop_reason: got %q, want end_turn", reason)
+	}
+}
+
+// TestModifyResponse_PassesThroughAlreadyStreamingMessages verifies we do
+// not touch a request that the client already marked stream:true, and that
+// the upstream SSE body is not rewritten by sseRewriter on its way back.
+func TestModifyResponse_PassesThroughAlreadyStreamingMessages(t *testing.T) {
+	const sseFixture = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n"
+
+	var sawStreamTrue bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), `"stream":true`) {
+			sawStreamTrue = true
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(sseFixture))
+	}))
+	defer upstream.Close()
+
+	proxy, err := buildProxy(upstream.URL+"/v1", "test-key")
+	if err != nil {
+		t.Fatalf("buildProxy: %v", err)
+	}
+	outer := httptest.NewServer(proxy)
+	defer outer.Close()
+
+	clientBody := `{"model":"claude-sonnet-4-6","stream":true,"messages":[]}`
+	req, _ := http.NewRequest(http.MethodPost, outer.URL+"/api/provider/anthropic/v1/messages", strings.NewReader(clientBody))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if !sawStreamTrue {
+		t.Errorf("upstream should have received stream:true verbatim")
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+		t.Errorf("client Content-Type: got %q, want text/event-stream", ct)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "message_start") {
+		t.Errorf("client did not receive raw SSE body; got: %s", body)
 	}
 }
 

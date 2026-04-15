@@ -60,20 +60,28 @@ file (and approximate line range where relevant) together with a short reason.
     a billable event that indicates a routing-table miss and deserves an
     error-level signal in the run log.
 
-- `internal/customproxy/` (entire package, ~450 lines)
+- `internal/customproxy/` (entire package, ~700 lines)
   - **Reason:** Non-upstream. New package that routes Amp requests to
-    third-party endpoints keyed by model name. Includes an SSE rewriter that
-    augments non-compliant `response.completed` frames with an empty
-    `output: []` array so downstream Amp clients stay happy. `ModifyResponse`
-    also carries two content-loss detectors that `Warn` (without mutating the
-    body) when augment returns:
-    - a non-streaming `/v1/responses` reply whose `output:[]` is empty
-      despite `usage.output_tokens > 0`; or
-    - a non-streaming `/v1/messages` reply whose `content:[]` is empty
-      despite `usage.output_tokens > 0`. The second case is the root cause
-      of Amp CLI's `librarian` subagent silently failing — the main agent
-      catches the empty tool output and falls back to its own `web_search`,
-      hiding the failure in normal UI.
+    third-party endpoints keyed by model name. Includes:
+    - An SSE rewriter (`sse_rewriter.go`) that augments non-compliant
+      OpenAI `response.completed` frames with a populated `output: []`
+      array so downstream Amp clients stay happy.
+    - A non-streaming `/v1/messages` stream-upgrade path
+      (`sse_messages_collapser.go`): augment's Anthropic Messages
+      endpoint drops assistant content in the non-streaming code path but
+      serves streaming correctly. `Director` rewrites such requests with
+      `"stream":true` and tags the request context; `ModifyResponse`
+      collapses the SSE reply back into a single JSON body with
+      `collapseMessagesSSE` so the downstream client sees the shape it
+      expected. Without this, Amp CLI's `librarian` subagent receives
+      empty tool output and the main agent silently falls back to its
+      own `web_search`.
+    - Two `ModifyResponse` detectors that `Warn` (without mutating the
+      body) when augment returns a non-streaming `/v1/responses` reply
+      whose `output:[]` is empty or a non-streaming `/v1/messages` reply
+      whose `content:[]` is empty despite non-zero `usage.output_tokens`.
+      Kept as a safety net in case the stream-upgrade path is ever
+      bypassed.
 
 - `internal/handlers/{claude,gemini,openai}/` (plus `handlers.go`)
   - **Reason:** Hand-written no-op stubs that replace upstream
