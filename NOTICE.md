@@ -40,12 +40,24 @@ file (and approximate line range where relevant) together with a short reason.
     and `"strconv"` support the custom-provider routing hook and the
     Content-Length realignment added below.
 
-- `internal/amp/fallback_handlers.go` (`WrapHandler`, lines 228–244)
+- `internal/amp/fallback_handlers.go` (`isGoogleNativePath`, end of file)
+  - **Reason:** New unexported helper used by the custom-provider routing
+    hook to identify Google v1beta / v1beta1 request paths and fall
+    through to ampcode.com rather than a format-incompatible custom
+    provider.
+
+- `internal/amp/fallback_handlers.go` (`WrapHandler`, lines 228–260)
   - **Reason:** Custom-provider routing hook (amp-proxy extension). After the
     force/default mode branches resolve the model, we short-circuit via
     `customproxy.GetGlobal().ProxyForModel(resolvedModel)` before the
     `len(providers) == 0` ampcode fallback, so requests for configured
     custom-provider models bypass the ampcode.com upstream entirely.
+    The hook skips the short-circuit when `isGoogleNativePath` matches the
+    request URL (Google `v1beta` / `v1beta1` `generateContent` shapes),
+    because custom providers like augment only speak OpenAI Responses and
+    Anthropic Messages. Without this guard, a Gemini model mapped onto a
+    custom provider would be forwarded to an endpoint that 404s on the
+    Google path, breaking Amp CLI's `finder` subagent.
 
 - `internal/amp/fallback_handlers.go` (`WrapHandler`, lines 239–241)
   - **Reason:** Realigns `c.Request.ContentLength` and the `Content-Length`

@@ -232,7 +232,37 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 		// that upstream and bypass both the local handler chain and the
 		// ampcode.com fallback. The Director in customproxy rewrites the
 		// path and swaps the Authorization header to the provider's key.
-		if customProxy := customproxy.GetGlobal().ProxyForModel(resolvedModel); customProxy != nil {
+		//
+		// Exception: Google v1beta / v1beta1 native paths
+		// (:generateContent, :streamGenerateContent). Custom providers like
+		// augment speak OpenAI Responses and Anthropic Messages, not the
+		// Google generateContent shape, so forwarding a Gemini model
+		// mapping there would 404. For these paths, skip customproxy AND
+		// skip the mapping handler chain (which would otherwise dispatch to
+		// the geminiBridge stub that returns 501) — go straight to the
+		// ampcode.com proxy, which knows how to talk to the real Google
+		// endpoint. Gemini requests carry the model name in the URL path,
+		// not the body, so rewriteModelInRequest was a no-op and bodyBytes
+		// still contains the original request unchanged.
+		customProxy := customproxy.GetGlobal().ProxyForModel(resolvedModel)
+		if customProxy != nil && isGoogleNativePath(c.Request.URL.Path) {
+			log.WithFields(log.Fields{
+				"model": resolvedModel,
+				"path":  c.Request.URL.Path,
+			}).Warn("amp fallback: customproxy skipped for Google v1beta path (format incompatible); forwarding directly to ampcode.com")
+			if proxy := fh.getProxy(); proxy != nil {
+				logAmpRouting(RouteTypeAmpCredits, modelName, "", "", requestPath)
+				c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				proxy.ServeHTTP(c.Writer, c.Request)
+				return
+			}
+			// No ampcode proxy available: let the normal fall-through run.
+			// That path will eventually hand the request to the Gemini
+			// stub handler and return 501, which is strictly better than
+			// a silent 404 from augment.
+			customProxy = nil
+		}
+		if customProxy != nil {
 			logAmpRouting(RouteTypeLocalProvider, modelName, resolvedModel, "custom", requestPath)
 			// rewriteModelInRequest above changed bodyBytes' length, but
 			// c.Request.ContentLength still reflects the original bytes.
@@ -362,4 +392,19 @@ func extractModelFromRequest(body []byte, c *gin.Context) string {
 	}
 
 	return ""
+}
+
+// isGoogleNativePath reports whether the request path is Google's v1beta /
+// v1beta1 generateContent shape. Custom providers in this repo (augment)
+// only understand OpenAI Responses and Anthropic Messages, so the
+// customproxy routing hook must skip these paths and let them fall
+// through to the ampcode.com proxy instead.
+func isGoogleNativePath(p string) bool {
+	if strings.Contains(p, "/v1beta1/") || strings.Contains(p, "/v1beta/") {
+		return true
+	}
+	if strings.HasSuffix(p, ":generateContent") || strings.HasSuffix(p, ":streamGenerateContent") {
+		return true
+	}
+	return false
 }
