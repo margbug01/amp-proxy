@@ -45,6 +45,17 @@ func isJSONResponsesPath(req *http.Request) bool {
 	return strings.Contains(req.URL.Path, "/v1/responses") || strings.HasSuffix(req.URL.Path, "/responses")
 }
 
+// isJSONMessagesPath reports whether the request is an Anthropic Messages
+// completion call whose path ends exactly in /messages. Sibling endpoints
+// like /v1/messages/count_tokens and /v1/messages/batches/... end in a
+// different segment and are naturally excluded by HasSuffix.
+func isJSONMessagesPath(req *http.Request) bool {
+	if req == nil || req.URL == nil {
+		return false
+	}
+	return strings.HasSuffix(req.URL.Path, "/messages")
+}
+
 // Provider represents a single configured upstream endpoint plus its
 // pre-built ReverseProxy instance.
 type Provider struct {
@@ -272,6 +283,39 @@ func buildProxy(rawURL, apiKey string) (*httputil.ReverseProxy, error) {
 						"path":          resp.Request.URL.Path,
 						"output_tokens": outputTokens,
 					}).Warn("customproxy: non-streaming /v1/responses returned empty output array despite completion tokens; client may not render the message correctly. Consider stream: true")
+				}
+			} else if isJSONMessagesPath(resp.Request) && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "application/json") {
+				// Non-streaming /v1/messages branch. Amp CLI's librarian
+				// subagent hardcodes non-streaming Anthropic Messages
+				// requests; augment's upstream silently drops the text
+				// blocks so content:[] comes back despite a non-zero
+				// usage.output_tokens. The symptom is that librarian
+				// tool_use calls return an empty string to the main agent
+				// and Amp CLI either bubbles a Connection error or falls
+				// back to its own web_search. We only warn here so the
+				// main agent's fallback path keeps working; a future fix
+				// can stream-upgrade the upstream request to recover the
+				// lost content.
+				const maxInspect = 10 * 1024 * 1024
+				buf, err := io.ReadAll(io.LimitReader(resp.Body, maxInspect))
+				if err != nil {
+					return err
+				}
+				_ = resp.Body.Close()
+				resp.Body = io.NopCloser(bytes.NewReader(buf))
+				resp.ContentLength = int64(len(buf))
+
+				contentLen := 0
+				if arr := gjson.GetBytes(buf, "content"); arr.IsArray() {
+					contentLen = len(arr.Array())
+				}
+				outputTokens := gjson.GetBytes(buf, "usage.output_tokens").Int()
+				if contentLen == 0 && outputTokens > 0 {
+					log.WithFields(log.Fields{
+						"path":          resp.Request.URL.Path,
+						"output_tokens": outputTokens,
+						"model":         gjson.GetBytes(buf, "model").String(),
+					}).Warn("customproxy: non-streaming /v1/messages returned empty content array despite output_tokens; augment content-loss bug — librarian subagent will silently fail")
 				}
 			}
 			return nil
