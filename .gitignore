@@ -31,6 +31,8 @@ desktop.ini
 # Logs
 *.log
 /logs/
+# Sibling of /run.log produced by scripts/restart.ps1's stdout redirect.
+/run.log*
 
 # Cookies / credentials
 cookies.txt

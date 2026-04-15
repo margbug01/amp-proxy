@@ -18,12 +18,16 @@ try {
         exit 1
     }
 
-    # Relaunch hidden, redirecting stdout/stderr to log files.
+    # Relaunch hidden. logrus writes to stderr by default, so we aim stderr
+    # at run.log (which matches what NOTICE.md, the restart docs, and the
+    # memory system all tell the operator to tail). stdout is routed to
+    # run.log.err mostly as a safety net — amp-proxy does not currently
+    # write anything to stdout.
     Start-Process -FilePath .\amp-proxy.exe `
         -ArgumentList '--config', '.\config.local.yaml' `
         -WindowStyle Hidden `
-        -RedirectStandardOutput .\run.log `
-        -RedirectStandardError  .\run.log.err
+        -RedirectStandardOutput .\run.log.err `
+        -RedirectStandardError  .\run.log
 
     # Let the process boot before tailing the log.
     Start-Sleep -Seconds 1
