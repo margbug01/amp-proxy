@@ -42,3 +42,4 @@ cookies.txt
 
 # OS-specific
 $RECYCLE.BIN/
+.ace-tool/
