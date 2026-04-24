@@ -76,7 +76,7 @@ func TestModifyResponse_WarnsOnAnthropicEmptyContent(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	proxy, err := buildProxy(upstream.URL+"/v1", "test-key")
+	proxy, err := buildProxy(upstream.URL+"/v1", "test-key", nil)
 	if err != nil {
 		t.Fatalf("buildProxy: %v", err)
 	}
@@ -172,7 +172,7 @@ data: {"type":"message_stop"}
 	}))
 	defer upstream.Close()
 
-	proxy, err := buildProxy(upstream.URL+"/v1", "test-key")
+	proxy, err := buildProxy(upstream.URL+"/v1", "test-key", nil)
 	if err != nil {
 		t.Fatalf("buildProxy: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestModifyResponse_PassesThroughAlreadyStreamingMessages(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	proxy, err := buildProxy(upstream.URL+"/v1", "test-key")
+	proxy, err := buildProxy(upstream.URL+"/v1", "test-key", nil)
 	if err != nil {
 		t.Fatalf("buildProxy: %v", err)
 	}
@@ -283,7 +283,7 @@ func TestModifyResponse_QuietOnPopulatedAnthropicContent(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	proxy, err := buildProxy(upstream.URL+"/v1", "test-key")
+	proxy, err := buildProxy(upstream.URL+"/v1", "test-key", nil)
 	if err != nil {
 		t.Fatalf("buildProxy: %v", err)
 	}

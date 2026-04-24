@@ -146,6 +146,14 @@ type CustomProvider struct {
 	// Models is the list of model names this provider serves. Requests whose
 	// body contains a matching model field are routed here.
 	Models []string `yaml:"models" json:"models"`
+
+	// RequestOverrides, when non-empty, is shallow-merged into every POST
+	// JSON body forwarded to this provider. Keys overwrite any value already
+	// present in the client-supplied body. Intended for endpoints that
+	// require a fixed extra field (e.g. DeepSeek's `reasoning_effort`) which
+	// Amp CLI itself does not emit. Only Anthropic Messages (/messages)
+	// requests are currently touched.
+	RequestOverrides map[string]any `yaml:"request-overrides,omitempty" json:"request-overrides,omitempty"`
 }
 
 // AmpUpstreamAPIKeyEntry maps a set of client API keys to a specific upstream

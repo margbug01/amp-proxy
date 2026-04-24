@@ -36,12 +36,20 @@ import (
 // incoming SSE needs to be collapsed back into a single JSON body.
 type upgradedMessagesKey struct{}
 
-// upgradeMessagesToStream flips a non-streaming Anthropic Messages
-// request into a streaming one in-place. Returns (upgraded, newBody, err).
-// On upgraded=false newBody still restores the original bytes to req.Body
-// via the caller so the proxy can forward the request regardless of
-// upgrade decision.
-func upgradeMessagesToStream(req *http.Request) (bool, io.ReadCloser, error) {
+// applyMessagesMutations rewrites an Anthropic /messages request body in
+// place to do two things:
+//  1. Upgrade non-streaming requests to streaming (workaround for augment's
+//     content-loss bug; harmless for endpoints without that bug).
+//  2. Merge provider-configured request-overrides into the body so upstreams
+//     that require a fixed extra field (e.g. DeepSeek's reasoning_effort)
+//     get it even though Amp CLI never emits one.
+//
+// Returns (upgraded, newBody, err). upgraded reports whether we set
+// stream:true — it drives whether ModifyResponse needs to collapse the SSE
+// back into a JSON body for the downstream client. newBody always carries
+// forward-replayable bytes even on the no-op path so the caller can swap
+// it in unconditionally.
+func applyMessagesMutations(req *http.Request, overrides map[string]any) (bool, io.ReadCloser, error) {
 	const maxBody = 16 * 1024 * 1024
 	if req.Body == nil {
 		return false, http.NoBody, nil
@@ -51,25 +59,39 @@ func upgradeMessagesToStream(req *http.Request) (bool, io.ReadCloser, error) {
 	if err != nil {
 		return false, io.NopCloser(bytes.NewReader(raw)), err
 	}
-	// If the client already asked for streaming, don't touch the body.
-	if gjson.GetBytes(raw, "stream").Bool() {
+	alreadyStreaming := gjson.GetBytes(raw, "stream").Bool()
+	// Fast path: nothing to do. Keeps augment's existing behaviour byte-for-
+	// byte when the operator hasn't configured overrides and the client
+	// already asked for streaming.
+	if alreadyStreaming && len(overrides) == 0 {
 		return false, io.NopCloser(bytes.NewReader(raw)), nil
 	}
 	var obj map[string]any
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return false, io.NopCloser(bytes.NewReader(raw)), fmt.Errorf("parse request body: %w", err)
 	}
-	obj["stream"] = true
+	upgraded := false
+	if !alreadyStreaming {
+		obj["stream"] = true
+		upgraded = true
+	}
+	// Overrides deliberately win over client-supplied values: they exist
+	// specifically to force a field (e.g. reasoning_effort:"max") that the
+	// client would otherwise not send. If the client ever needs to shadow
+	// one, the operator can drop the key from config.
+	for k, v := range overrides {
+		obj[k] = v
+	}
 	newBody, err := json.Marshal(obj)
 	if err != nil {
-		return false, io.NopCloser(bytes.NewReader(raw)), fmt.Errorf("marshal upgraded body: %w", err)
+		return false, io.NopCloser(bytes.NewReader(raw)), fmt.Errorf("marshal mutated body: %w", err)
 	}
 	req.ContentLength = int64(len(newBody))
 	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(newBody)))
 	// Advertise SSE so the upstream picks its streaming representation
 	// even if it decides format from the Accept header.
 	req.Header.Set("Accept", "text/event-stream")
-	return true, io.NopCloser(bytes.NewReader(newBody)), nil
+	return upgraded, io.NopCloser(bytes.NewReader(newBody)), nil
 }
 
 // isEventStream reports whether the given Content-Type is an SSE stream
@@ -107,6 +129,11 @@ type Provider struct {
 	APIKey string
 	Models []string
 
+	// requestOverrides is a shallow-merged patch applied to every
+	// POST /messages JSON body forwarded to this provider. See
+	// config.CustomProvider.RequestOverrides for semantics.
+	requestOverrides map[string]any
+
 	proxy *httputil.ReverseProxy
 }
 
@@ -140,18 +167,30 @@ func (r *Registry) Configure(cfgs []config.CustomProvider) error {
 			continue
 		}
 
-		proxy, err := buildProxy(rawURL, c.APIKey)
+		// Deep-enough copy of overrides so later Configure calls can't
+		// mutate an already-registered provider's map out from under an
+		// in-flight Director invocation.
+		var overrides map[string]any
+		if len(c.RequestOverrides) > 0 {
+			overrides = make(map[string]any, len(c.RequestOverrides))
+			for k, v := range c.RequestOverrides {
+				overrides[k] = v
+			}
+		}
+
+		proxy, err := buildProxy(rawURL, c.APIKey, overrides)
 		if err != nil {
 			log.Errorf("customproxy: failed to build proxy for %q: %v", name, err)
 			continue
 		}
 
 		p := &Provider{
-			Name:   name,
-			URL:    rawURL,
-			APIKey: c.APIKey,
-			Models: append([]string(nil), c.Models...),
-			proxy:  proxy,
+			Name:             name,
+			URL:              rawURL,
+			APIKey:           c.APIKey,
+			Models:           append([]string(nil), c.Models...),
+			requestOverrides: overrides,
+			proxy:            proxy,
 		}
 
 		for _, model := range c.Models {
@@ -241,8 +280,10 @@ func stripThinkingSuffix(model string) string {
 }
 
 // buildProxy constructs a ReverseProxy with a Director that rewrites the
-// request path and Authorization header.
-func buildProxy(rawURL, apiKey string) (*httputil.ReverseProxy, error) {
+// request path and Authorization header. overrides, if non-empty, is
+// shallow-merged into the body of every POST /messages request before
+// forwarding.
+func buildProxy(rawURL, apiKey string, overrides map[string]any) (*httputil.ReverseProxy, error) {
 	target, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse target %q: %w", rawURL, err)
@@ -281,18 +322,21 @@ func buildProxy(rawURL, apiKey string) (*httputil.ReverseProxy, error) {
 			req.Header.Del("Anthropic-Beta")
 			req.Header.Del("anthropic-beta")
 
-			// Non-streaming /v1/messages content-loss workaround.
-			// augment silently drops assistant content in the
-			// non-streaming Anthropic Messages path but serves the
-			// streaming path correctly, so we flip stream:true here
-			// and collapse the SSE reply in ModifyResponse.
+			// Non-streaming /v1/messages content-loss workaround plus
+			// provider request-overrides injection. augment silently
+			// drops assistant content in the non-streaming Anthropic
+			// Messages path but serves the streaming path correctly, so
+			// we flip stream:true here and collapse the SSE reply in
+			// ModifyResponse. overrides are merged in the same pass so a
+			// provider like DeepSeek can force reasoning_effort without
+			// Amp CLI knowing about the field.
 			upgraded := false
 			if req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/messages") {
-				ok, newBody, err := upgradeMessagesToStream(req)
+				ok, newBody, err := applyMessagesMutations(req, overrides)
 				if err != nil {
-					log.Warnf("customproxy: upgrade /v1/messages to stream failed: %v", err)
+					log.Warnf("customproxy: mutate /messages body failed: %v", err)
 				}
-				// upgradeMessagesToStream always returns a fresh body
+				// applyMessagesMutations always returns a fresh body
 				// reader, even on no-op paths, so we can swap it in
 				// unconditionally.
 				req.Body = newBody
