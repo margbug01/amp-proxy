@@ -25,9 +25,13 @@ func Load(path string) (*Config, error) {
 }
 
 // applyDefaults fills in reasonable defaults for any unset scalar fields.
+// Host and Port default independently so that a config with only `port:` set
+// still binds loopback-only instead of silently binding all interfaces.
 func (c *Config) applyDefaults() {
-	if c.Host == "" && c.Port == 0 {
+	if c.Host == "" {
 		c.Host = "127.0.0.1"
+	}
+	if c.Port == 0 {
 		c.Port = 8787
 	}
 	if c.AmpCode.UpstreamURL == "" {
