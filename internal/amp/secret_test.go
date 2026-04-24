@@ -3,6 +3,7 @@ package amp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -60,6 +61,8 @@ func TestMultiSourceSecret_PrecedenceOrder(t *testing.T) {
 }
 
 func TestMultiSourceSecret_CacheBehavior(t *testing.T) {
+	t.Setenv("AMP_API_KEY", "")
+
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 	p := filepath.Join(tmpDir, "secrets.json")
@@ -108,6 +111,8 @@ func TestMultiSourceSecret_CacheBehavior(t *testing.T) {
 }
 
 func TestMultiSourceSecret_FileHandling(t *testing.T) {
+	t.Setenv("AMP_API_KEY", "")
+
 	ctx := context.Background()
 
 	t.Run("missing_file_no_error", func(t *testing.T) {
@@ -168,6 +173,10 @@ func TestMultiSourceSecret_FileHandling(t *testing.T) {
 }
 
 func TestMultiSourceSecret_Concurrency(t *testing.T) {
+	// The test relies on the file branch; clear AMP_API_KEY so a developer
+	// machine with the env var set doesn't short-circuit at the env branch.
+	t.Setenv("AMP_API_KEY", "")
+
 	tmpDir := t.TempDir()
 	p := filepath.Join(tmpDir, "secrets.json")
 	if err := os.WriteFile(p, []byte(`{"apiKey@https://ampcode.com/":"concurrent"}`), 0600); err != nil {
@@ -195,7 +204,7 @@ func TestMultiSourceSecret_Concurrency(t *testing.T) {
 					return
 				}
 				if val != "concurrent" {
-					errors <- err
+					errors <- fmt.Errorf("got %q, want %q", val, "concurrent")
 					return
 				}
 			}
@@ -248,7 +257,11 @@ func TestStaticSecretSource(t *testing.T) {
 }
 
 func TestMultiSourceSecret_CacheEmptyResult(t *testing.T) {
-	// Test that missing file results are cached to avoid repeated file reads
+	// Test that missing file results are cached to avoid repeated file reads.
+	// Clear AMP_API_KEY so the env branch in Get() doesn't mask the file branch
+	// on developer machines.
+	t.Setenv("AMP_API_KEY", "")
+
 	tmpDir := t.TempDir()
 	p := filepath.Join(tmpDir, "nonexistent.json")
 
