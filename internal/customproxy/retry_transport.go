@@ -26,17 +26,24 @@ type retryingTransport struct {
 	delay time.Duration
 }
 
+// maxRetryBufferedBody caps how much of a request body we buffer for retry
+// replay. Mirrors the ceiling used by the fallback handler: legitimate Amp
+// requests fit well under this, and an unbounded ReadAll here would let a
+// huge streamed upload wedge the proxy in memory.
+const maxRetryBufferedBody = 16 * 1024 * 1024
+
 // RoundTrip executes a single request and retries once if the first attempt
 // fails with a transient error. The request body is buffered up-front so it
 // can be replayed on the second attempt.
 func (t *retryingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Buffer the body up-front: req.Body is single-read so we must keep a
 	// copy for the potential retry. Also populate req.GetBody so net/http
-	// can replay on 3xx redirects in the base transport.
+	// can replay on 3xx redirects in the base transport. Bounded so a very
+	// large upload can't be silently slurped into memory here.
 	var bodyBytes []byte
 	if req.Body != nil {
 		var err error
-		bodyBytes, err = io.ReadAll(req.Body)
+		bodyBytes, err = io.ReadAll(io.LimitReader(req.Body, maxRetryBufferedBody))
 		if err != nil {
 			return nil, err
 		}

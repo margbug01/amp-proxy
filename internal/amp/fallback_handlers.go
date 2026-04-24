@@ -133,14 +133,21 @@ func (fh *FallbackHandler) SetModelMapper(mapper ModelMapper) {
 	fh.modelMapper = mapper
 }
 
+// maxFallbackRequestBody caps how much of an incoming request body we will
+// buffer in WrapHandler. Amp CLI prompts fit comfortably inside a few MiB;
+// anything above is either pathological or a DoS attempt, and letting
+// io.ReadAll run unbounded means a single malicious client can OOM the proxy.
+const maxFallbackRequestBody = 16 * 1024 * 1024
+
 // WrapHandler wraps a gin.HandlerFunc with fallback logic
 // If the model's provider is not configured in CLIProxyAPI, it forwards to ampcode.com
 func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		requestPath := c.Request.URL.Path
 
-		// Read the request body to extract the model name
-		bodyBytes, err := io.ReadAll(c.Request.Body)
+		// Read the request body to extract the model name. Bounded to
+		// maxFallbackRequestBody so a huge request body cannot OOM us.
+		bodyBytes, err := io.ReadAll(io.LimitReader(c.Request.Body, maxFallbackRequestBody))
 		if err != nil {
 			log.Errorf("amp fallback: failed to read request body: %v", err)
 			handler(c)
