@@ -1,11 +1,14 @@
 package amp
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/margbug01/amp-proxy/internal/config"
+	"github.com/margbug01/amp-proxy/internal/customproxy"
 	"github.com/margbug01/amp-proxy/internal/handlers"
 )
 
@@ -143,8 +146,8 @@ func TestRegisterProviderAliases_DynamicModelsHandler(t *testing.T) {
 
 	base := &handlers.BaseAPIHandler{}
 
-	m := &AmpModule{authMiddleware_: func(c *gin.Context) { c.AbortWithStatus(http.StatusOK) }}
-	m.registerProviderAliases(r, base, func(c *gin.Context) { c.AbortWithStatus(http.StatusOK) })
+	m := &AmpModule{authMiddleware_: func(c *gin.Context) { c.Next() }}
+	m.registerProviderAliases(r, base, func(c *gin.Context) { c.Next() })
 
 	providers := []string{"openai", "anthropic", "google", "groq", "cerebras"}
 
@@ -155,11 +158,86 @@ func TestRegisterProviderAliases_DynamicModelsHandler(t *testing.T) {
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, req)
 
-			// Should not 404
-			if w.Code == http.StatusNotFound {
-				t.Fatalf("models route not found for provider: %s", provider)
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("expected 503 for %s without upstream or custom providers, got %d", provider, w.Code)
 			}
 		})
+	}
+}
+
+func TestRegisterProviderAliases_ModelsProxyToUpstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+
+	upstreamCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+		if r.URL.Path != "/api/provider/openai/v1/models" {
+			t.Fatalf("unexpected upstream path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"upstream-model","object":"model"}]}`))
+	}))
+	defer upstream.Close()
+
+	m := &AmpModule{authMiddleware_: func(c *gin.Context) { c.Next() }}
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.setProxy(proxy)
+	m.registerProviderAliases(r, &handlers.BaseAPIHandler{}, func(c *gin.Context) { c.Next() })
+
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/api/provider/openai/v1/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if !upstreamCalled {
+		t.Fatal("expected models request to be proxied upstream")
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestRegisterProviderAliases_ModelsSynthesizesCustomProviders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	if err := customproxy.GetGlobal().Configure([]config.CustomProvider{{
+		Name:   "test-custom-models",
+		URL:    "http://127.0.0.1:1/v1",
+		Models: []string{"z-model", "a-model"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	defer customproxy.GetGlobal().Configure(nil)
+
+	r := gin.New()
+	m := &AmpModule{authMiddleware_: func(c *gin.Context) { c.Next() }}
+	m.registerProviderAliases(r, &handlers.BaseAPIHandler{}, func(c *gin.Context) { c.Next() })
+
+	req := httptest.NewRequest(http.MethodGet, "/api/provider/openai/models", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+	var resp struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Object != "list" || len(resp.Data) != 2 || resp.Data[0].ID != "a-model" || resp.Data[1].ID != "z-model" {
+		t.Fatalf("unexpected model list: %+v", resp)
 	}
 }
 

@@ -12,12 +12,10 @@ import (
 )
 
 // accessLog returns a Gin middleware that emits one structured log line per
-// request. For POST/JSON bodies it peeks at the "model" field so that the
-// log row shows which upstream the request targets, while carefully
-// restoring the body so downstream handlers still see the full payload.
-// Intended for development and customer-support debugging sessions — the
-// overhead is non-negligible and you probably don't want this in prod.
-func accessLog() gin.HandlerFunc {
+// request. When modelPeek is true, POST/JSON bodies are also read up to a
+// bounded size to include the "model" and "stream" fields; the body is then
+// restored so downstream handlers still see the full payload.
+func accessLog(modelPeek bool) gin.HandlerFunc {
 	const maxPeekBytes = 1 << 20 // 1 MiB upper bound on body peek
 
 	return func(c *gin.Context) {
@@ -28,7 +26,7 @@ func accessLog() gin.HandlerFunc {
 
 		model := ""
 		stream := false
-		if method == "POST" && strings.Contains(strings.ToLower(c.Request.Header.Get("Content-Type")), "json") {
+		if modelPeek && method == "POST" && strings.Contains(strings.ToLower(c.Request.Header.Get("Content-Type")), "json") {
 			if c.Request.Body != nil && c.Request.ContentLength >= 0 && c.Request.ContentLength < maxPeekBytes {
 				body, err := io.ReadAll(c.Request.Body)
 				if err == nil {

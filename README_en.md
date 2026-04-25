@@ -90,7 +90,7 @@ flowchart LR
 ```bash
 git clone https://github.com/margbug01/amp-proxy.git
 cd amp-proxy
-go build -o amp-proxy .
+go build -o amp-proxy ./cmd/amp-proxy
 ```
 
 ### Configure — the fast path: `init`
@@ -171,6 +171,9 @@ ampcode:
       models:
         - "gpt-5.4"
         - "gpt-5.4-mini"
+      responses-translate: true   # only for chat/completions-only gateways
+      request-overrides:          # optional fixed upstream fields
+        reasoning_effort: "high"
 
   gemini-route-mode: "translate"
 ```
@@ -193,7 +196,7 @@ requests, which most OpenAI-compatible gateways don't speak.
 | Value | Behaviour |
 |---|---|
 | `ampcode` (default) | Falls through to `ampcode.com`. Guaranteed protocol fidelity, consumes Amp credits. |
-| `translate` | amp-proxy rewrites the Gemini body into an OpenAI Responses API call, forwards it to the matched custom provider, and translates the reply back into Gemini JSON before `finder` reads it. Saves credits; synthesised `call_id`s and a dropped `thoughtSignature` are the only semantic losses. |
+| `translate` | amp-proxy rewrites Gemini `generateContent` bodies into OpenAI Responses API calls, forwards them to the matched custom provider, and translates replies back into Gemini JSON before `finder` reads them. Saves credits; synthesised `call_id`s and a dropped `thoughtSignature` are the only semantic losses. `streamGenerateContent` translation is not supported yet and falls through to ampcode.com. |
 
 ### Authentication model
 
@@ -233,8 +236,10 @@ Set `AMP_PROXY_URL` / `AMP_PROXY_KEY` to target a non-default instance.
 
 Set `debug.capture-path-substring` in `config.yaml` to have amp-proxy
 write raw request/response bodies for matching URL paths into
-`./capture/*.log`. Intended for local development — bodies contain
-prompts and tool calls, do not leave it on in production.
+`./capture/*.log`. `debug.access-log-model-peek` lets the access log read
+JSON request bodies for `model` / `stream` fields and is off by default.
+These switches are for local development — bodies contain prompts and tool
+calls, do not leave them on in production.
 
 ### Divergence tracking
 

@@ -3,12 +3,14 @@ package amp
 import (
 	"bytes"
 	"io"
+	"net/http"
 	"net/http/httputil"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/margbug01/amp-proxy/internal/bodylimit"
 	"github.com/margbug01/amp-proxy/internal/customproxy"
 	"github.com/margbug01/amp-proxy/internal/thinking"
 	"github.com/margbug01/amp-proxy/internal/util"
@@ -147,10 +149,12 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 
 		// Read the request body to extract the model name. Bounded to
 		// maxFallbackRequestBody so a huge request body cannot OOM us.
-		bodyBytes, err := io.ReadAll(io.LimitReader(c.Request.Body, maxFallbackRequestBody))
+		bodyBytes, err := bodylimit.ReadAll(c.Request.Body, maxFallbackRequestBody)
 		if err != nil {
-			log.Errorf("amp fallback: failed to read request body: %v", err)
-			handler(c)
+			_ = c.Request.Body.Close()
+			err = bodylimit.Wrap("amp fallback request body", maxFallbackRequestBody, err)
+			log.Warnf("amp fallback: %v", err)
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request_body_too_large", "message": err.Error()})
 			return
 		}
 
@@ -164,8 +168,12 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 		// Try to extract model from request body or URL path (for Gemini)
 		modelName := extractModelFromRequest(bodyBytes, c)
 		if modelName == "" {
-			// Can't determine model, proceed with normal handler
-			handler(c)
+			if proxy := fh.getProxy(); proxy != nil {
+				c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				proxy.ServeHTTP(c.Writer, c.Request)
+				return
+			}
+			c.JSON(400, gin.H{"error": "missing model in request"})
 			return
 		}
 
@@ -307,10 +315,6 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 				proxy.ServeHTTP(c.Writer, c.Request)
 				return
 			}
-			// No ampcode proxy available: let the normal fall-through run.
-			// That path will eventually hand the request to the Gemini
-			// stub handler and return 501, which is strictly better than
-			// a silent 404 from augment.
 			customProxy = nil
 		}
 		if customProxy != nil {

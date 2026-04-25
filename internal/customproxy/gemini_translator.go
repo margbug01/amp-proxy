@@ -14,6 +14,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 
+	"github.com/margbug01/amp-proxy/internal/bodylimit"
 	"github.com/margbug01/amp-proxy/internal/thinking"
 )
 
@@ -619,10 +620,10 @@ func translateGeminiResponse(resp *http.Response, gt *geminiTranslateCtx) error 
 		_ = resp.Body.Close()
 	} else {
 		const maxInspect = 10 * 1024 * 1024
-		buf, readErr := io.ReadAll(io.LimitReader(resp.Body, maxInspect))
+		buf, readErr := bodylimit.ReadAll(resp.Body, maxInspect)
 		_ = resp.Body.Close()
 		if readErr != nil {
-			err = fmt.Errorf("read non-streaming /v1/responses body: %w", readErr)
+			err = bodylimit.Wrap("non-streaming /v1/responses body", maxInspect, readErr)
 		} else {
 			log.WithFields(log.Fields{
 				"path":         resp.Request.URL.Path,

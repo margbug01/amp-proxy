@@ -70,6 +70,11 @@ ampcode:
     #   models:
     #     - "gpt-5.4"
     #     - "gpt-5.4-mini"
+    #   # For chat/completions-only upstreams such as api.deepseek.com:
+    #   # responses-translate: true
+    #   # Optional fixed fields shallow-merged into Anthropic /messages bodies:
+    #   # request-overrides:
+    #   #   reasoning_effort: "high"
 
   # How to route Google Gemini v1beta / v1beta1 generateContent requests
   # (used by Amp CLI's finder subagent) when they hit a custom provider:
@@ -78,10 +83,10 @@ ampcode:
   #               to the matched custom provider, saving credits
   gemini-route-mode: "ampcode"
 
-# Debug-only: capture request and response bodies to disk for any URL path
-# containing the given substring. Leave empty in production — bodies may
-# include prompts, tool calls, and other sensitive context.
+# Debug-only settings. Leave disabled in production — captured/logged bodies
+# may include prompts, tool calls, and other sensitive context.
 #
 # debug:
+#   access-log-model-peek: false
 #   capture-path-substring: "/v1/responses"
 #   capture-dir: "./capture"

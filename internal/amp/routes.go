@@ -9,11 +9,12 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/margbug01/amp-proxy/internal/logging"
+	"github.com/margbug01/amp-proxy/internal/customproxy"
 	"github.com/margbug01/amp-proxy/internal/handlers"
 	"github.com/margbug01/amp-proxy/internal/handlers/claude"
 	"github.com/margbug01/amp-proxy/internal/handlers/gemini"
 	"github.com/margbug01/amp-proxy/internal/handlers/openai"
+	"github.com/margbug01/amp-proxy/internal/logging"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -58,30 +59,10 @@ func (m *AmpModule) localhostOnlyMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// Use actual TCP connection address (RemoteAddr) to prevent header spoofing
-		// This cannot be forged by X-Forwarded-For or other client-controlled headers
-		remoteAddr := c.Request.RemoteAddr
-
-		// RemoteAddr format is "IP:port" or "[IPv6]:port", extract just the IP
-		host, _, err := net.SplitHostPort(remoteAddr)
-		if err != nil {
-			// Try parsing as raw IP (shouldn't happen with standard HTTP, but be defensive)
-			host = remoteAddr
-		}
-
-		// Parse the IP to handle both IPv4 and IPv6
-		ip := net.ParseIP(host)
-		if ip == nil {
-			log.Warnf("amp management: invalid RemoteAddr %s, denying access", remoteAddr)
-			c.AbortWithStatusJSON(403, gin.H{
-				"error": "Access denied: management routes restricted to localhost",
-			})
-			return
-		}
-
-		// Check if IP is loopback (127.0.0.1 or ::1)
-		if !ip.IsLoopback() {
-			log.Warnf("amp management: non-localhost connection from %s attempted access, denying", remoteAddr)
+		// Use actual TCP connection address (RemoteAddr) to prevent header spoofing.
+		// This cannot be forged by X-Forwarded-For or other client-controlled headers.
+		if !isLoopbackRemoteAddr(c.Request.RemoteAddr) {
+			log.Warnf("amp management: non-localhost connection from %s attempted access, denying", c.Request.RemoteAddr)
 			c.AbortWithStatusJSON(403, gin.H{
 				"error": "Access denied: management routes restricted to localhost",
 			})
@@ -90,6 +71,15 @@ func (m *AmpModule) localhostOnlyMiddleware() gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+func isLoopbackRemoteAddr(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // noCORSMiddleware disables CORS for management routes to prevent browser-based attacks.
@@ -141,6 +131,36 @@ func wrapManagementAuth(auth gin.HandlerFunc, prefixes ...string) gin.HandlerFun
 	}
 }
 
+func proxyToUpstream(c *gin.Context, getProxy func() *httputil.ReverseProxy) bool {
+	proxy := getProxy()
+	if proxy == nil {
+		return false
+	}
+	proxy.ServeHTTP(c.Writer, c.Request)
+	return true
+}
+
+func synthesizeCustomProviderModels(c *gin.Context) {
+	models := customproxy.GetGlobal().ModelIDs()
+	if len(models) == 0 {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "amp upstream proxy not available"})
+		return
+	}
+
+	data := make([]gin.H, 0, len(models))
+	for _, model := range models {
+		data = append(data, gin.H{
+			"id":       model,
+			"object":   "model",
+			"owned_by": "custom",
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"object": "list",
+		"data":   data,
+	})
+}
+
 // registerManagementRoutes registers Amp management proxy routes
 // These routes proxy through to the Amp control plane for OAuth, user management, etc.
 // Uses dynamic middleware and proxy getter for hot-reload support.
@@ -177,12 +197,9 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 			}
 		}()
 
-		proxy := m.getProxy()
-		if proxy == nil {
+		if !proxyToUpstream(c, m.getProxy) {
 			c.JSON(503, gin.H{"error": "amp upstream proxy not available"})
-			return
 		}
-		proxy.ServeHTTP(c.Writer, c.Request)
 	}
 
 	// Management routes - these are proxied directly to Amp upstream
@@ -208,7 +225,13 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	// These need the same security middleware as the /api/* routes (dynamic for hot-reload)
 	rootMiddleware := []gin.HandlerFunc{m.managementAvailabilityMiddleware(), noCORSMiddleware(), m.localhostOnlyMiddleware()}
 	if authWithBypass != nil {
-		rootMiddleware = append(rootMiddleware, authWithBypass)
+		rootMiddleware = append(rootMiddleware, func(c *gin.Context) {
+			if m.IsRestrictedToLocalhost() && isLoopbackRemoteAddr(c.Request.RemoteAddr) {
+				authWithBypass(c)
+				return
+			}
+			auth(c)
+		})
 	}
 	// Add clientAPIKeyMiddleware after auth for per-client upstream routing
 	rootMiddleware = append(rootMiddleware, clientAPIKeyMiddleware())
@@ -288,24 +311,16 @@ func (m *AmpModule) registerProviderAliases(engine *gin.Engine, baseHandler *han
 
 	provider := ampProviders.Group("/:provider")
 
-	// Dynamic models handler - routes to appropriate provider based on path parameter
 	ampModelsHandler := func(c *gin.Context) {
-		providerName := strings.ToLower(c.Param("provider"))
-
-		switch providerName {
-		case "anthropic":
-			claudeCodeHandlers.ClaudeModels(c)
-		case "google":
-			geminiHandlers.GeminiModels(c)
-		default:
-			// Default to OpenAI-compatible (works for openai, groq, cerebras, etc.)
-			openaiHandlers.OpenAIModels(c)
+		if proxyToUpstream(c, m.getProxy) {
+			return
 		}
+		synthesizeCustomProviderModels(c)
 	}
 
 	// Root-level routes (for providers that omit /v1, like groq/cerebras)
 	// Wrap handlers with fallback logic to forward to ampcode.com when provider not found
-	provider.GET("/models", ampModelsHandler) // Models endpoint doesn't need fallback (no body to check)
+	provider.GET("/models", ampModelsHandler)
 	provider.POST("/chat/completions", fallbackHandler.WrapHandler(openaiHandlers.ChatCompletions))
 	provider.POST("/completions", fallbackHandler.WrapHandler(openaiHandlers.Completions))
 	provider.POST("/responses", fallbackHandler.WrapHandler(openaiResponsesHandlers.Responses))
@@ -313,7 +328,7 @@ func (m *AmpModule) registerProviderAliases(engine *gin.Engine, baseHandler *han
 	// /v1 routes (OpenAI/Claude-compatible endpoints)
 	v1Amp := provider.Group("/v1")
 	{
-		v1Amp.GET("/models", ampModelsHandler) // Models endpoint doesn't need fallback
+		v1Amp.GET("/models", ampModelsHandler)
 
 		// OpenAI-compatible endpoints with fallback
 		v1Amp.POST("/chat/completions", fallbackHandler.WrapHandler(openaiHandlers.ChatCompletions))
@@ -329,8 +344,12 @@ func (m *AmpModule) registerProviderAliases(engine *gin.Engine, baseHandler *han
 	// Note: Gemini handler extracts model from URL path, so fallback logic needs special handling
 	v1betaAmp := provider.Group("/v1beta")
 	{
-		v1betaAmp.GET("/models", geminiHandlers.GeminiModels)
+		v1betaAmp.GET("/models", ampModelsHandler)
 		v1betaAmp.POST("/models/*action", fallbackHandler.WrapHandler(geminiHandlers.GeminiHandler))
-		v1betaAmp.GET("/models/*action", geminiHandlers.GeminiGetHandler)
+		v1betaAmp.GET("/models/*action", func(c *gin.Context) {
+			if !proxyToUpstream(c, m.getProxy) {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "amp upstream proxy not available"})
+			}
+		})
 	}
 }

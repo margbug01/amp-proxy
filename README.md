@@ -83,7 +83,7 @@ flowchart LR
 ```bash
 git clone https://github.com/margbug01/amp-proxy.git
 cd amp-proxy
-go build -o amp-proxy .
+go build -o amp-proxy ./cmd/amp-proxy
 ```
 
 ### 配置（推荐走 `init` 向导）
@@ -160,6 +160,9 @@ ampcode:
       models:
         - "gpt-5.4"
         - "gpt-5.4-mini"
+      responses-translate: true   # chat/completions-only 网关才需要
+      request-overrides:          # 可选：注入固定上游字段
+        reasoning_effort: "high"
 
   gemini-route-mode: "translate"
 ```
@@ -182,7 +185,7 @@ Amp CLI 的 `finder` 子 agent 会发 Google `v1beta1 generateContent` 请求，
 | 值 | 行为 |
 |---|---|
 | `ampcode`（默认） | 兜底走 `ampcode.com`，协议保真，消耗 Amp credits |
-| `translate` | amp-proxy 把 Gemini 请求翻译成 OpenAI Responses 发到已匹配的 custom-provider，然后把响应翻译回 Gemini JSON 再交给 `finder`。节省 credits；代价是会合成 `call_id` 并丢弃 `thoughtSignature`，是唯二的语义损耗 |
+| `translate` | amp-proxy 把 Gemini `generateContent` 请求翻译成 OpenAI Responses 发到已匹配的 custom-provider，然后把响应翻译回 Gemini JSON 再交给 `finder`。节省 credits；代价是会合成 `call_id` 并丢弃 `thoughtSignature`，是唯二的语义损耗。`streamGenerateContent` 暂不支持翻译，会继续兜底到 ampcode.com |
 
 ### 认证模型
 
@@ -219,8 +222,9 @@ node scripts/test_gemini_translate.js
 ### Debug 抓包
 
 在 `config.yaml` 里设 `debug.capture-path-substring`，amp-proxy 会把所有
-匹配的 URL 请求和响应原文写到 `./capture/*.log`。仅用于本地开发 ——
-里面有 prompts 和 tool calls，生产环境别开。
+匹配的 URL 请求和响应原文写到 `./capture/*.log`。`debug.access-log-model-peek`
+可让 access log 额外读取 JSON body 里的 `model` / `stream` 字段，默认关闭。
+这些开关仅用于本地开发 —— 里面有 prompts 和 tool calls，生产环境别开。
 
 ### Upstream 分歧追踪
 

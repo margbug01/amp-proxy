@@ -39,6 +39,17 @@ func (cw *captureWriter) Write(p []byte) (int, error) {
 
 var captureSeq uint64
 
+func shouldRedactHeader(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	name = strings.ReplaceAll(name, "_", "-")
+	switch name {
+	case "authorization", "cookie", "set-cookie", "x-api-key", "x-goog-api-key", "api-key":
+		return true
+	default:
+		return strings.HasSuffix(name, "-api-key")
+	}
+}
+
 // bodyCapture returns a middleware that saves the request body, a truncated
 // copy of the streamed response, and the status code to one file per
 // request under dir. Only requests whose URL path contains pathSubstring
@@ -89,7 +100,7 @@ func bodyCapture(dir, pathSubstring string) gin.HandlerFunc {
 		name := fmt.Sprintf("%s-%04d-%s.log", ts, seq, safePath)
 		p := filepath.Join(dir, name)
 
-		f, err := os.Create(p)
+		f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
 			log.Errorf("bodyCapture: create %q: %v", p, err)
 			return
@@ -99,7 +110,7 @@ func bodyCapture(dir, pathSubstring string) gin.HandlerFunc {
 		fmt.Fprintf(f, "=== %s %s ===\n", c.Request.Method, c.Request.URL.Path)
 		fmt.Fprintf(f, "Client-Headers:\n")
 		for k, v := range c.Request.Header {
-			if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "X-Api-Key") {
+			if shouldRedactHeader(k) {
 				fmt.Fprintf(f, "  %s: <redacted>\n", k)
 				continue
 			}

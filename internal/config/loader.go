@@ -8,19 +8,25 @@ import (
 )
 
 // Load reads a YAML configuration file from disk and returns a populated
-// Config. The caller is responsible for validating the resulting server
-// bind fields if defaults are not acceptable.
+// Config. Defaults are applied before the configuration is validated.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config %q: %w", path, err)
 	}
 
-	var cfg Config
+	cfg := Config{
+		AmpCode: AmpCode{
+			RestrictManagementToLocalhost: true,
+		},
+	}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config %q: %w", path, err)
 	}
 	cfg.applyDefaults()
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("validate config %q: %w", path, err)
+	}
 	return &cfg, nil
 }
 

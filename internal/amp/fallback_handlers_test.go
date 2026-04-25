@@ -3,6 +3,7 @@ package amp
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -12,6 +13,119 @@ import (
 	"github.com/margbug01/amp-proxy/internal/config"
 	"github.com/margbug01/amp-proxy/internal/registry"
 )
+
+func TestFallbackHandler_MissingModelProxiesUpstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	upstreamCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer upstream.Close()
+
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fallback := NewFallbackHandler(func() *httputil.ReverseProxy { return proxy })
+
+	handlerCalled := false
+	r := gin.New()
+	r.POST("/chat/completions", fallback.WrapHandler(func(c *gin.Context) {
+		handlerCalled = true
+		c.Status(http.StatusNotImplemented)
+	}))
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/chat/completions", "application/json", bytes.NewReader([]byte(`{"messages":[]}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if handlerCalled {
+		t.Fatal("handler should not be called when missing model can be proxied")
+	}
+	if !upstreamCalled {
+		t.Fatal("expected missing-model request to proxy upstream")
+	}
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected status 202, got %d", resp.StatusCode)
+	}
+}
+
+func TestFallbackHandler_MissingModelReturnsBadRequestWithoutUpstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	fallback := NewFallbackHandler(func() *httputil.ReverseProxy { return nil })
+	handlerCalled := false
+	r := gin.New()
+	r.POST("/chat/completions", fallback.WrapHandler(func(c *gin.Context) {
+		handlerCalled = true
+		c.Status(http.StatusNotImplemented)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/chat/completions", bytes.NewReader([]byte(`{"messages":[]}`)))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if handlerCalled {
+		t.Fatal("handler should not be called when missing model has no upstream")
+	}
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d", w.Code)
+	}
+}
+
+type repeatedByteReader struct {
+	remaining int
+	b         byte
+}
+
+func (r *repeatedByteReader) Read(p []byte) (int, error) {
+	if r.remaining <= 0 {
+		return 0, io.EOF
+	}
+	if len(p) > r.remaining {
+		p = p[:r.remaining]
+	}
+	for i := range p {
+		p[i] = r.b
+	}
+	r.remaining -= len(p)
+	return len(p), nil
+}
+
+func TestFallbackHandler_RejectsOverLimitBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	fallback := NewFallbackHandler(func() *httputil.ReverseProxy { return nil })
+	handlerCalled := false
+
+	r := gin.New()
+	r.POST("/chat/completions", fallback.WrapHandler(func(c *gin.Context) {
+		handlerCalled = true
+		c.Status(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/chat/completions", io.NopCloser(&repeatedByteReader{remaining: maxFallbackRequestBody + 1, b: 'x'}))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if handlerCalled {
+		t.Fatal("wrapped handler should not be called for over-limit body")
+	}
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status: got %d, want %d", w.Code, http.StatusRequestEntityTooLarge)
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte(`"request_body_too_large"`)) {
+		t.Fatalf("unexpected body: %s", w.Body.String())
+	}
+}
 
 func TestFallbackHandler_ModelMapping_PreservesThinkingSuffixAndRewritesResponse(t *testing.T) {
 	gin.SetMode(gin.TestMode)

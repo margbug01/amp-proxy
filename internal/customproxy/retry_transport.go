@@ -10,6 +10,8 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+
+	"github.com/margbug01/amp-proxy/internal/bodylimit"
 )
 
 // retryingTransport wraps an http.RoundTripper with a single automatic retry
@@ -36,6 +38,10 @@ const maxRetryBufferedBody = 16 * 1024 * 1024
 // fails with a transient error. The request body is buffered up-front so it
 // can be replayed on the second attempt.
 func (t *retryingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err, _ := req.Context().Value(directorErrorKey{}).(error); err != nil {
+		return nil, err
+	}
+
 	// Buffer the body up-front: req.Body is single-read so we must keep a
 	// copy for the potential retry. Also populate req.GetBody so net/http
 	// can replay on 3xx redirects in the base transport. Bounded so a very
@@ -43,9 +49,10 @@ func (t *retryingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	var bodyBytes []byte
 	if req.Body != nil {
 		var err error
-		bodyBytes, err = io.ReadAll(io.LimitReader(req.Body, maxRetryBufferedBody))
+		bodyBytes, err = bodylimit.ReadAll(req.Body, maxRetryBufferedBody)
 		if err != nil {
-			return nil, err
+			_ = req.Body.Close()
+			return nil, bodylimit.Wrap("retryable request body", maxRetryBufferedBody, err)
 		}
 		_ = req.Body.Close()
 		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))

@@ -13,13 +13,13 @@ import (
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
 
+	sdkaccess "github.com/margbug01/amp-proxy/internal/access"
 	"github.com/margbug01/amp-proxy/internal/amp"
 	"github.com/margbug01/amp-proxy/internal/auth"
 	"github.com/margbug01/amp-proxy/internal/config"
 	"github.com/margbug01/amp-proxy/internal/customproxy"
 	"github.com/margbug01/amp-proxy/internal/handlers"
 	"github.com/margbug01/amp-proxy/internal/modules"
-	sdkaccess "github.com/margbug01/amp-proxy/internal/access"
 )
 
 // Server owns the HTTP server, the Gin engine, and the amp module instance.
@@ -47,7 +47,7 @@ func New(cfg *config.Config) (*Server, error) {
 
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
-	engine.Use(gin.Recovery(), accessLog())
+	engine.Use(gin.Recovery(), accessLog(cfg.Debug.AccessLogModelPeek))
 
 	// Opt-in bodyCapture middleware. Only registered when cfg.Debug has
 	// a non-empty path substring; leave empty in production to avoid
@@ -92,6 +92,8 @@ func New(cfg *config.Config) (*Server, error) {
 			Addr:              addr,
 			Handler:           engine,
 			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       60 * time.Second,
+			IdleTimeout:       120 * time.Second,
 		},
 	}, nil
 }
@@ -129,13 +131,16 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 // OnConfigUpdated replaces the live validator keys, refreshes the custom
-// provider registry, and notifies the amp module. Intended to be invoked by
-// a future hot-reload watcher.
+// provider registry, and notifies the amp module. It validates all dependent
+// state before swapping so a bad reload keeps the previous configuration active.
 func (s *Server) OnConfigUpdated(cfg *config.Config) error {
+	if err := customproxy.GetGlobal().Configure(cfg.AmpCode.CustomProviders); err != nil {
+		return fmt.Errorf("configure custom providers: %w", err)
+	}
+	if err := s.ampModule.OnConfigUpdated(cfg); err != nil {
+		return err
+	}
 	s.cfg = cfg
 	s.validator.SetKeys(cfg.APIKeys)
-	if err := customproxy.GetGlobal().Configure(cfg.AmpCode.CustomProviders); err != nil {
-		log.Errorf("custom provider reconfigure failed: %v", err)
-	}
-	return s.ampModule.OnConfigUpdated(cfg)
+	return nil
 }

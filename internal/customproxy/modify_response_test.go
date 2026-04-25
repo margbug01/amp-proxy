@@ -2,6 +2,7 @@ package customproxy
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -76,7 +77,7 @@ func TestModifyResponse_WarnsOnAnthropicEmptyContent(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	proxy, err := buildProxy(upstream.URL+"/v1", "test-key", nil)
+	proxy, err := buildProxy(upstream.URL+"/v1", "test-key", nil, false)
 	if err != nil {
 		t.Fatalf("buildProxy: %v", err)
 	}
@@ -172,7 +173,7 @@ data: {"type":"message_stop"}
 	}))
 	defer upstream.Close()
 
-	proxy, err := buildProxy(upstream.URL+"/v1", "test-key", nil)
+	proxy, err := buildProxy(upstream.URL+"/v1", "test-key", nil, false)
 	if err != nil {
 		t.Fatalf("buildProxy: %v", err)
 	}
@@ -238,7 +239,7 @@ func TestModifyResponse_PassesThroughAlreadyStreamingMessages(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	proxy, err := buildProxy(upstream.URL+"/v1", "test-key", nil)
+	proxy, err := buildProxy(upstream.URL+"/v1", "test-key", nil, false)
 	if err != nil {
 		t.Fatalf("buildProxy: %v", err)
 	}
@@ -270,6 +271,71 @@ func TestModifyResponse_PassesThroughAlreadyStreamingMessages(t *testing.T) {
 // TestModifyResponse_QuietOnPopulatedAnthropicContent guards against a false
 // positive: a normal Anthropic Messages response with real text blocks must
 // not trigger the warning.
+func TestModifyResponse_ErrorHandlerReturnsSanitizedJSON(t *testing.T) {
+	secretErr := `dial tcp 10.0.0.1:443: api_key=secret"bad`
+	proxy, err := buildProxy("http://127.0.0.1:1/v1", "test-key", nil, false)
+	if err != nil {
+		t.Fatalf("buildProxy: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	w := httptest.NewRecorder()
+	proxy.ErrorHandler(w, req, errors.New(secretErr))
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status: got %d, want %d", w.Code, http.StatusBadGateway)
+	}
+	if !gjson.Valid(w.Body.String()) {
+		t.Fatalf("body is not valid JSON: %q", w.Body.String())
+	}
+	if gjson.Get(w.Body.String(), "error").String() != "customproxy_upstream_error" {
+		t.Fatalf("unexpected error payload: %s", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), secretErr) || strings.Contains(w.Body.String(), "detail") {
+		t.Fatalf("error response leaked detail: %s", w.Body.String())
+	}
+}
+
+func TestModifyResponse_PreservesOverLimitInspectionBody(t *testing.T) {
+	const maxInspect = 10 * 1024 * 1024
+	prefix := `{"output":[],"usage":{"output_tokens":1},"pad":"`
+	suffix := `"}`
+	totalLen := maxInspect + 1024
+	if len(prefix)+len(suffix) >= totalLen {
+		t.Fatal("test fixture prefix/suffix too large")
+	}
+	upstreamBody := prefix + strings.Repeat("x", totalLen-len(prefix)-len(suffix)) + suffix
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(upstreamBody))
+	}))
+	defer upstream.Close()
+
+	proxy, err := buildProxy(upstream.URL+"/v1", "test-key", nil, false)
+	if err != nil {
+		t.Fatalf("buildProxy: %v", err)
+	}
+	outer := httptest.NewServer(proxy)
+	defer outer.Close()
+
+	resp, err := http.Post(outer.URL+"/api/provider/openai/v1/responses", "application/json", strings.NewReader(`{"model":"gpt-5.4"}`))
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if string(body) != upstreamBody {
+		t.Fatalf("over-limit inspection body was not preserved: got %d bytes want %d", len(body), len(upstreamBody))
+	}
+	if got := resp.Header.Get("Content-Length"); got != "" {
+		t.Fatalf("Content-Length header: got %q, want empty for skipped inspection", got)
+	}
+}
+
 func TestModifyResponse_QuietOnPopulatedAnthropicContent(t *testing.T) {
 	logBuf, restore := captureLogrus(t)
 	defer restore()
@@ -283,7 +349,7 @@ func TestModifyResponse_QuietOnPopulatedAnthropicContent(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	proxy, err := buildProxy(upstream.URL+"/v1", "test-key", nil)
+	proxy, err := buildProxy(upstream.URL+"/v1", "test-key", nil, false)
 	if err != nil {
 		t.Fatalf("buildProxy: %v", err)
 	}
@@ -303,4 +369,3 @@ func TestModifyResponse_QuietOnPopulatedAnthropicContent(t *testing.T) {
 		t.Errorf("warning fired on healthy response:\n%s", logged)
 	}
 }
-

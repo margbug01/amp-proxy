@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/margbug01/amp-proxy/internal/bodylimit"
 	"github.com/margbug01/amp-proxy/internal/config"
 )
 
@@ -155,6 +157,23 @@ func TestModifyResponse_GzipScenarios(t *testing.T) {
 				t.Fatalf("Content-Encoding: want %q, got %q", tc.wantCE, ce)
 			}
 		})
+	}
+}
+
+func TestModifyResponse_ErrorsOnGzipDecompressionLimit(t *testing.T) {
+	proxy, err := createReverseProxy("http://example.com", NewStaticSecretSource("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oversized := bytes.Repeat([]byte("x"), maxAmpProxyDecompressedBody+1)
+	resp := mkResp(http.StatusOK, http.Header{}, gzipBytes(oversized))
+	err = proxy.ModifyResponse(resp)
+	if err == nil {
+		t.Fatal("ModifyResponse: expected decompressed body limit error")
+	}
+	if !errors.Is(err, bodylimit.ErrTooLarge) {
+		t.Fatalf("ModifyResponse error = %v, want bodylimit.ErrTooLarge", err)
 	}
 }
 

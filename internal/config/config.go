@@ -7,6 +7,12 @@
 // struct are retained here.
 package config
 
+import (
+	"fmt"
+	"net/url"
+	"strings"
+)
+
 // Config represents the application's configuration loaded from a YAML file.
 // Only the fields consumed by the amp module and by the amp-proxy server
 // bootstrap are declared here.
@@ -35,6 +41,11 @@ type Config struct {
 // DebugConfig enables optional development-only middlewares.
 // All fields default to the zero value (everything off).
 type DebugConfig struct {
+	// AccessLogModelPeek enables request-body peeking in accessLog so the
+	// structured request log can include model and stream fields. Leave false
+	// to keep access logging cheap and avoid reading request bodies there.
+	AccessLogModelPeek bool `yaml:"access-log-model-peek,omitempty" json:"access-log-model-peek,omitempty"`
+
 	// CapturePathSubstring, when non-empty, enables bodyCapture middleware
 	// on every request whose URL path contains the substring. The captured
 	// request and response bodies (up to 2 MiB each) are written under
@@ -82,7 +93,7 @@ type AmpCode struct {
 	// RestrictManagementToLocalhost restricts Amp management routes
 	// (/api/user, /api/threads, /api/auth, /docs, /settings, etc.) to only
 	// accept connections from 127.0.0.1 / ::1. Prevents drive-by browser
-	// attacks and remote access to management endpoints. Default: false.
+	// attacks and remote access to management endpoints. Default: true.
 	RestrictManagementToLocalhost bool `yaml:"restrict-management-to-localhost" json:"restrict-management-to-localhost"`
 
 	// ModelMappings defines model name mappings for Amp CLI requests.
@@ -154,6 +165,16 @@ type CustomProvider struct {
 	// Amp CLI itself does not emit. Only Anthropic Messages (/messages)
 	// requests are currently touched.
 	RequestOverrides map[string]any `yaml:"request-overrides,omitempty" json:"request-overrides,omitempty"`
+
+	// ResponsesTranslate, when true, turns on OpenAI Responses API (`/v1/responses`)
+	// ↔ chat/completions (`/v1/chat/completions`) translation for this provider.
+	// Amp CLI's deep mode sends requests shaped against the Responses API, but
+	// some OpenAI-compatible upstreams (e.g. DeepSeek's official endpoint)
+	// only implement chat/completions. When enabled, amp-proxy rewrites
+	// outbound /responses requests into chat/completions and streams the
+	// upstream reply back in Responses SSE format. Default: false (augment
+	// and other Responses-native upstreams pass through unchanged).
+	ResponsesTranslate bool `yaml:"responses-translate,omitempty" json:"responses-translate,omitempty"`
 }
 
 // AmpUpstreamAPIKeyEntry maps a set of client API keys to a specific upstream
@@ -165,4 +186,100 @@ type AmpUpstreamAPIKeyEntry struct {
 
 	// APIKeys are the client API keys that map to this upstream key.
 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
+}
+
+// Validate returns an error if the configuration cannot be safely applied.
+func (c *Config) Validate() error {
+	if c.Port < 1 || c.Port > 65535 {
+		return fmt.Errorf("port must be between 1 and 65535")
+	}
+
+	if len(c.APIKeys) == 0 {
+		return fmt.Errorf("api-keys must contain at least one key")
+	}
+	for i, key := range c.APIKeys {
+		if strings.TrimSpace(key) == "" {
+			return fmt.Errorf("api-keys[%d] must not be empty", i)
+		}
+	}
+
+	if err := validateAbsoluteURL(c.AmpCode.UpstreamURL, "ampcode.upstream-url"); err != nil {
+		return err
+	}
+
+	switch strings.TrimSpace(c.AmpCode.GeminiRouteMode) {
+	case "", "ampcode", "translate":
+	default:
+		return fmt.Errorf("ampcode.gemini-route-mode must be empty, ampcode, or translate")
+	}
+
+	seenProviderModels := map[string]int{}
+	for i, provider := range c.AmpCode.CustomProviders {
+		prefix := fmt.Sprintf("ampcode.custom-providers[%d]", i)
+		if strings.TrimSpace(provider.Name) == "" {
+			return fmt.Errorf("%s.name must not be empty", prefix)
+		}
+		if err := validateAbsoluteURL(provider.URL, prefix+".url"); err != nil {
+			return err
+		}
+		if len(provider.Models) == 0 {
+			return fmt.Errorf("%s.models must contain at least one model", prefix)
+		}
+		for j, model := range provider.Models {
+			trimmed := strings.TrimSpace(model)
+			if trimmed == "" {
+				return fmt.Errorf("%s.models[%d] must not be empty", prefix, j)
+			}
+			key := strings.ToLower(trimmed)
+			if first, ok := seenProviderModels[key]; ok {
+				return fmt.Errorf("%s.models[%d] duplicates model from ampcode.custom-providers[%d]", prefix, j, first)
+			}
+			seenProviderModels[key] = i
+		}
+	}
+
+	localKeys := map[string]struct{}{}
+	for _, key := range c.APIKeys {
+		localKeys[strings.TrimSpace(key)] = struct{}{}
+	}
+	mappedClientKeys := map[string]int{}
+	for i, entry := range c.AmpCode.UpstreamAPIKeys {
+		prefix := fmt.Sprintf("ampcode.upstream-api-keys[%d]", i)
+		if strings.TrimSpace(entry.UpstreamAPIKey) == "" {
+			return fmt.Errorf("%s.upstream-api-key must not be empty", prefix)
+		}
+		if len(entry.APIKeys) == 0 {
+			return fmt.Errorf("%s.api-keys must contain at least one key", prefix)
+		}
+		for j, key := range entry.APIKeys {
+			trimmed := strings.TrimSpace(key)
+			if trimmed == "" {
+				return fmt.Errorf("%s.api-keys[%d] must not be empty", prefix, j)
+			}
+			if _, ok := localKeys[trimmed]; !ok {
+				return fmt.Errorf("%s.api-keys[%d] must match a top-level api-keys entry", prefix, j)
+			}
+			if first, ok := mappedClientKeys[trimmed]; ok {
+				return fmt.Errorf("%s.api-keys[%d] duplicates client key from ampcode.upstream-api-keys[%d]", prefix, j, first)
+			}
+			mappedClientKeys[trimmed] = i
+		}
+	}
+
+	return nil
+}
+
+func validateAbsoluteURL(raw, field string) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return fmt.Errorf("%s must be a valid URL: %w", field, err)
+	}
+	if !u.IsAbs() || u.Host == "" {
+		return fmt.Errorf("%s must be an absolute URL", field)
+	}
+	return nil
 }

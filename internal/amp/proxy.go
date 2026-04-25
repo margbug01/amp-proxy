@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/margbug01/amp-proxy/internal/bodylimit"
 	"github.com/margbug01/amp-proxy/internal/misc"
 	log "github.com/sirupsen/logrus"
 )
@@ -54,6 +55,11 @@ type readCloser struct {
 
 func (rc *readCloser) Read(p []byte) (int, error) { return rc.r.Read(p) }
 func (rc *readCloser) Close() error               { return rc.c.Close() }
+
+const (
+	maxAmpProxyCompressedBody   = 16 * 1024 * 1024
+	maxAmpProxyDecompressedBody = 64 * 1024 * 1024
+)
 
 // createReverseProxy creates a reverse proxy handler for Amp upstream
 // with automatic gzip decompression via ModifyResponse
@@ -128,15 +134,12 @@ func createReverseProxy(upstreamURL string, secretSource SecretSource) (*httputi
 		// Check for gzip magic bytes (0x1f 0x8b)
 		// If n < 2, we didn't get enough bytes, so it's not gzip
 		if n >= 2 && header[0] == 0x1f && header[1] == 0x8b {
-			// It's gzip - read the rest of the body
-			rest, err := io.ReadAll(originalBody)
+			// It's gzip - read the rest of the body with a hard cap.
+			restLimit := int64(maxAmpProxyCompressedBody - n)
+			rest, err := bodylimit.ReadAll(originalBody, restLimit)
 			if err != nil {
-				// Restore what we read and return original body (preserve Close behavior)
-				resp.Body = &readCloser{
-					r: io.MultiReader(bytes.NewReader(header[:n]), originalBody),
-					c: originalBody,
-				}
-				return nil
+				_ = originalBody.Close()
+				return bodylimit.Wrap("amp upstream compressed response body", maxAmpProxyCompressedBody, err)
 			}
 
 			// Reconstruct complete gzipped data
@@ -152,9 +155,13 @@ func createReverseProxy(upstreamURL string, secretSource SecretSource) (*httputi
 				return nil
 			}
 
-			decompressed, err := io.ReadAll(gzipReader)
+			decompressed, err := bodylimit.ReadAll(gzipReader, maxAmpProxyDecompressedBody)
 			_ = gzipReader.Close()
 			if err != nil {
+				if errors.Is(err, bodylimit.ErrTooLarge) {
+					_ = originalBody.Close()
+					return bodylimit.Wrap("amp upstream decompressed response body", maxAmpProxyDecompressedBody, err)
+				}
 				log.Warnf("amp proxy: gzip decompress error: %v", err)
 				// Close original body and return in-memory copy
 				_ = originalBody.Close()

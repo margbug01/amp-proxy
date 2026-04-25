@@ -1,12 +1,35 @@
 package customproxy
 
 import (
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/margbug01/amp-proxy/internal/bodylimit"
 )
+
+type repeatedByteReader struct {
+	remaining int
+	b         byte
+}
+
+func (r *repeatedByteReader) Read(p []byte) (int, error) {
+	if r.remaining <= 0 {
+		return 0, io.EOF
+	}
+	if len(p) > r.remaining {
+		p = p[:r.remaining]
+	}
+	for i := range p {
+		p[i] = r.b
+	}
+	r.remaining -= len(p)
+	return len(p), nil
+}
 
 // TestRetryingTransport_RetriesOnTransientError verifies that a transient
 // connection failure on the first attempt is followed by a successful
@@ -69,6 +92,32 @@ func TestRetryingTransport_RetriesOnTransientError(t *testing.T) {
 	// Allow a generous lower bound to avoid flaking on slow CI.
 	if elapsed < 200*time.Millisecond {
 		t.Errorf("elapsed %v, expected at least ~250ms backoff", elapsed)
+	}
+}
+
+func TestRetryingTransport_ErrorsOnOverLimitBody(t *testing.T) {
+	rt := &retryingTransport{
+		base:  http.DefaultTransport,
+		delay: time.Millisecond,
+	}
+
+	req, err := http.NewRequest(http.MethodPost, "http://example.invalid", io.NopCloser(&repeatedByteReader{remaining: maxRetryBufferedBody + 1, b: 'x'}))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+
+	resp, err := rt.RoundTrip(req)
+	if err == nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		t.Fatal("RoundTrip: expected over-limit error, got nil")
+	}
+	if !errors.Is(err, bodylimit.ErrTooLarge) {
+		t.Fatalf("RoundTrip error = %v, want bodylimit.ErrTooLarge", err)
+	}
+	if resp != nil {
+		t.Fatalf("response = %#v, want nil", resp)
 	}
 }
 

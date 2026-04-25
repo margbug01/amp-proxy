@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 
@@ -59,9 +60,49 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	go watchConfig(ctx, *configPath, srv)
 
 	if err := srv.Run(ctx); err != nil {
 		log.Fatalf("server run: %v", err)
 	}
 	log.Info("amp-proxy shut down cleanly")
+}
+
+func watchConfig(ctx context.Context, path string, srv *server.Server) {
+	info, err := os.Stat(path)
+	if err != nil {
+		log.Errorf("config watcher: stat %s: %v", path, err)
+		return
+	}
+	lastMod := info.ModTime()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			info, err := os.Stat(path)
+			if err != nil {
+				log.Errorf("config watcher: stat %s: %v", path, err)
+				continue
+			}
+			modTime := info.ModTime()
+			if modTime.Equal(lastMod) {
+				continue
+			}
+			lastMod = modTime
+			cfg, err := config.Load(path)
+			if err != nil {
+				log.Errorf("config watcher: reload %s: %v", path, err)
+				continue
+			}
+			if err := srv.OnConfigUpdated(cfg); err != nil {
+				log.Errorf("config watcher: apply %s: %v", path, err)
+				continue
+			}
+			log.Infof("config reloaded from %s", path)
+		}
+	}
 }

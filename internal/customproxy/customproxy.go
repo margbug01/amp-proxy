@@ -16,11 +16,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +30,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 
+	"github.com/margbug01/amp-proxy/internal/bodylimit"
 	"github.com/margbug01/amp-proxy/internal/config"
 )
 
@@ -35,6 +38,16 @@ import (
 // with "stream":true. ModifyResponse uses the tag to decide whether the
 // incoming SSE needs to be collapsed back into a single JSON body.
 type upgradedMessagesKey struct{}
+
+type directorErrorKey struct{}
+
+type readCloser struct {
+	r io.Reader
+	c io.Closer
+}
+
+func (rc *readCloser) Read(p []byte) (int, error) { return rc.r.Read(p) }
+func (rc *readCloser) Close() error               { return rc.c.Close() }
 
 // applyMessagesMutations rewrites an Anthropic /messages request body in
 // place to do two things:
@@ -54,9 +67,10 @@ func applyMessagesMutations(req *http.Request, overrides map[string]any) (bool, 
 	if req.Body == nil {
 		return false, http.NoBody, nil
 	}
-	raw, err := io.ReadAll(io.LimitReader(req.Body, maxBody))
+	raw, err := bodylimit.ReadAll(req.Body, maxBody)
 	_ = req.Body.Close()
 	if err != nil {
+		err = bodylimit.Wrap("messages request body", maxBody, err)
 		return false, io.NopCloser(bytes.NewReader(raw)), err
 	}
 	alreadyStreaming := gjson.GetBytes(raw, "stream").Bool()
@@ -121,6 +135,27 @@ func isJSONMessagesPath(req *http.Request) bool {
 	return strings.HasSuffix(req.URL.Path, "/messages")
 }
 
+func inspectBody(resp *http.Response, limit int64) ([]byte, bool, error) {
+	prefix, overLimit, err := bodylimit.ReadPrefix(resp.Body, limit)
+	if err != nil {
+		return nil, false, bodylimit.Wrap("upstream response body", limit, err)
+	}
+	if overLimit {
+		resp.Body = &readCloser{
+			r: io.MultiReader(bytes.NewReader(prefix), resp.Body),
+			c: resp.Body,
+		}
+		resp.ContentLength = -1
+		resp.Header.Del("Content-Length")
+		return nil, false, nil
+	}
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(prefix))
+	resp.ContentLength = int64(len(prefix))
+	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(prefix)))
+	return prefix, true, nil
+}
+
 // Provider represents a single configured upstream endpoint plus its
 // pre-built ReverseProxy instance.
 type Provider struct {
@@ -134,6 +169,10 @@ type Provider struct {
 	// config.CustomProvider.RequestOverrides for semantics.
 	requestOverrides map[string]any
 
+	// responsesTranslate turns on OpenAI Responses ↔ chat/completions
+	// translation for this provider. See config.CustomProvider.ResponsesTranslate.
+	responsesTranslate bool
+
 	proxy *httputil.ReverseProxy
 }
 
@@ -141,6 +180,7 @@ type Provider struct {
 type Registry struct {
 	mu      sync.RWMutex
 	byModel map[string]*Provider
+	models  []string
 }
 
 var globalRegistry = &Registry{byModel: make(map[string]*Provider)}
@@ -156,6 +196,7 @@ func GetGlobal() *Registry {
 // other valid entries still register.
 func (r *Registry) Configure(cfgs []config.CustomProvider) error {
 	newMap := make(map[string]*Provider, len(cfgs)*2)
+	activeModels := make([]string, 0, len(cfgs)*2)
 
 	for i := range cfgs {
 		c := cfgs[i]
@@ -163,8 +204,7 @@ func (r *Registry) Configure(cfgs []config.CustomProvider) error {
 		rawURL := strings.TrimSpace(c.URL)
 
 		if name == "" || rawURL == "" || len(c.Models) == 0 {
-			log.Warnf("customproxy: skipping invalid provider entry (name=%q url=%q models=%d)", c.Name, c.URL, len(c.Models))
-			continue
+			return fmt.Errorf("custom provider %d is invalid: name, url, and models are required", i)
 		}
 
 		// Deep-enough copy of overrides so later Configure calls can't
@@ -178,19 +218,19 @@ func (r *Registry) Configure(cfgs []config.CustomProvider) error {
 			}
 		}
 
-		proxy, err := buildProxy(rawURL, c.APIKey, overrides)
+		proxy, err := buildProxy(rawURL, c.APIKey, overrides, c.ResponsesTranslate)
 		if err != nil {
-			log.Errorf("customproxy: failed to build proxy for %q: %v", name, err)
-			continue
+			return fmt.Errorf("custom provider %q: %w", name, err)
 		}
 
 		p := &Provider{
-			Name:             name,
-			URL:              rawURL,
-			APIKey:           c.APIKey,
-			Models:           append([]string(nil), c.Models...),
-			requestOverrides: overrides,
-			proxy:            proxy,
+			Name:               name,
+			URL:                rawURL,
+			APIKey:             c.APIKey,
+			Models:             append([]string(nil), c.Models...),
+			requestOverrides:   overrides,
+			responsesTranslate: c.ResponsesTranslate,
+			proxy:              proxy,
 		}
 
 		for _, model := range c.Models {
@@ -198,24 +238,23 @@ func (r *Registry) Configure(cfgs []config.CustomProvider) error {
 			if model == "" {
 				continue
 			}
-			if existing, ok := newMap[model]; ok {
+			key := modelLookupKey(model)
+			if existing, ok := newMap[key]; ok {
 				log.Warnf("customproxy: model %q served by both %q and %q; keeping %q", model, existing.Name, name, existing.Name)
 				continue
 			}
-			newMap[model] = p
+			newMap[key] = p
+			activeModels = append(activeModels, model)
 		}
 	}
 
 	r.mu.Lock()
 	r.byModel = newMap
+	r.models = append([]string(nil), activeModels...)
 	r.mu.Unlock()
 
 	if len(newMap) > 0 {
-		models := make([]string, 0, len(newMap))
-		for k := range newMap {
-			models = append(models, k)
-		}
-		log.Infof("customproxy: active for models: %v", models)
+		log.Infof("customproxy: active for models: %v", activeModels)
 	} else {
 		log.Debug("customproxy: no custom providers configured")
 	}
@@ -223,45 +262,54 @@ func (r *Registry) Configure(cfgs []config.CustomProvider) error {
 }
 
 // ProxyForModel returns the reverse proxy that serves the given model, or
-// nil if no custom provider claims it. If the exact name is not registered,
-// the lookup falls back to the name with any trailing thinking suffix
-// ("(high)", "(xhigh)", "(16384)", ...) stripped. This matches
+// nil if no custom provider claims it. Lookup is case-insensitive. If the name
+// is not registered, the lookup falls back to the name with any trailing
+// thinking suffix ("(high)", "(xhigh)", "(16384)", ...) stripped. This matches
 // fallback_handlers.go's resolvedModel, which may carry a suffix inherited
 // from the incoming request.
 func (r *Registry) ProxyForModel(model string) *httputil.ReverseProxy {
-	if model == "" {
-		return nil
-	}
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if p, ok := r.byModel[model]; ok {
+	if p := r.providerForModel(model); p != nil {
 		return p.proxy
 	}
-	if base := stripThinkingSuffix(model); base != model {
-		if p, ok := r.byModel[base]; ok {
-			return p.proxy
-		}
-	}
 	return nil
+}
+
+// ModelIDs returns the registered custom provider model IDs in deterministic order.
+func (r *Registry) ModelIDs() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	models := append([]string(nil), r.models...)
+	slices.Sort(models)
+	return models
 }
 
 // ProviderForModel returns the full Provider metadata for logging purposes.
 // Suffix-stripped fallback matches ProxyForModel.
 func (r *Registry) ProviderForModel(model string) *Provider {
+	return r.providerForModel(model)
+}
+
+func (r *Registry) providerForModel(model string) *Provider {
+	model = strings.TrimSpace(model)
 	if model == "" {
 		return nil
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if p, ok := r.byModel[model]; ok {
+	if p, ok := r.byModel[modelLookupKey(model)]; ok {
 		return p
 	}
 	if base := stripThinkingSuffix(model); base != model {
-		if p, ok := r.byModel[base]; ok {
+		if p, ok := r.byModel[modelLookupKey(base)]; ok {
 			return p
 		}
 	}
 	return nil
+}
+
+func modelLookupKey(model string) string {
+	return strings.ToLower(strings.TrimSpace(model))
 }
 
 // stripThinkingSuffix removes a trailing thinking suffix of the form
@@ -282,8 +330,10 @@ func stripThinkingSuffix(model string) string {
 // buildProxy constructs a ReverseProxy with a Director that rewrites the
 // request path and Authorization header. overrides, if non-empty, is
 // shallow-merged into the body of every POST /messages request before
-// forwarding.
-func buildProxy(rawURL, apiKey string, overrides map[string]any) (*httputil.ReverseProxy, error) {
+// forwarding. responsesTranslate, when true, rewrites outbound POST
+// /responses requests into /chat/completions and flips the upstream SSE
+// reply back into Responses SSE in ModifyResponse.
+func buildProxy(rawURL, apiKey string, overrides map[string]any, responsesTranslate bool) (*httputil.ReverseProxy, error) {
 	target, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse target %q: %w", rawURL, err)
@@ -334,7 +384,12 @@ func buildProxy(rawURL, apiKey string, overrides map[string]any) (*httputil.Reve
 			if req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/messages") {
 				ok, newBody, err := applyMessagesMutations(req, overrides)
 				if err != nil {
-					log.Warnf("customproxy: mutate /messages body failed: %v", err)
+					if errors.Is(err, bodylimit.ErrTooLarge) {
+						ctx := context.WithValue(req.Context(), directorErrorKey{}, err)
+						*req = *req.WithContext(ctx)
+					} else {
+						log.Warnf("customproxy: mutate /messages body failed: %v", err)
+					}
 				}
 				// applyMessagesMutations always returns a fresh body
 				// reader, even on no-op paths, so we can swap it in
@@ -347,18 +402,67 @@ func buildProxy(rawURL, apiKey string, overrides map[string]any) (*httputil.Reve
 				}
 			}
 
+			// Responses ↔ chat/completions translation. Enabled per provider
+			// for OpenAI-compatible upstreams that only implement the
+			// chat/completions endpoint (DeepSeek's official api.deepseek.com
+			// is the motivating case). We rewrite the request body into chat
+			// shape, retarget the path to /chat/completions, and tag the
+			// context so ModifyResponse can stream the reply back as
+			// Responses SSE.
+			responsesTranslated := false
+			if responsesTranslate && req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/responses") {
+				if newBody, tctx, err := translateResponsesRequestBody(req); err != nil {
+					if newBody != nil {
+						req.Body = io.NopCloser(bytes.NewReader(newBody))
+					}
+					if errors.Is(err, bodylimit.ErrTooLarge) {
+						ctx := context.WithValue(req.Context(), directorErrorKey{}, err)
+						*req = *req.WithContext(ctx)
+					} else {
+						log.Warnf("customproxy: responses→chat translation failed: %v", err)
+					}
+				} else {
+					req.Body = io.NopCloser(bytes.NewReader(newBody))
+					captureOutboundChatRequest(newBody)
+					// Retarget: /<base>/responses → /<base>/chat/completions
+					req.URL.Path = strings.TrimSuffix(req.URL.Path, "/responses") + "/chat/completions"
+					req.URL.RawPath = ""
+					if tctx.stream {
+						req.Header.Set("Accept", "text/event-stream")
+					} else {
+						req.Header.Set("Accept", "application/json")
+					}
+					req.Header.Set("Content-Type", "application/json")
+					ctx := context.WithValue(req.Context(), responsesTranslateKey{}, tctx)
+					*req = *req.WithContext(ctx)
+					responsesTranslated = true
+				}
+			}
+
 			log.WithFields(log.Fields{
-				"method":   req.Method,
-				"from":     originalPath,
-				"to":       target.Scheme + "://" + target.Host + req.URL.Path,
-				"upgraded": upgraded,
+				"method":               req.Method,
+				"from":                 originalPath,
+				"to":                   target.Scheme + "://" + target.Host + req.URL.Path,
+				"upgraded":             upgraded,
+				"responses_translated": responsesTranslated,
 			}).Info("customproxy: forwarding")
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Errorf("customproxy: upstream %s error: %v", target.Host, err)
+			status := http.StatusBadGateway
+			code := "customproxy_upstream_error"
+			message := "Upstream request failed"
+			if errors.Is(err, bodylimit.ErrTooLarge) {
+				status = http.StatusRequestEntityTooLarge
+				code = "body_too_large"
+				message = "Request or response body exceeds proxy limit"
+			}
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadGateway)
-			_, _ = w.Write([]byte(`{"error":"customproxy: upstream request failed","detail":"` + err.Error() + `"}`))
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error":   code,
+				"message": message,
+			})
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			// Gemini translate: if the request context was tagged in
@@ -370,6 +474,47 @@ func buildProxy(rawURL, apiKey string, overrides map[string]any) (*httputil.Reve
 			// processed by sseRewriter or the empty-output warning paths.
 			if gt := geminiTranslateFromContext(resp.Request.Context()); gt != nil {
 				return translateGeminiResponse(resp, gt)
+			}
+
+			// Responses ↔ chat/completions translation on the reply side.
+			// If the Director tagged this request, the upstream body is a
+			// chat/completions SSE stream and we re-emit Responses SSE for
+			// the downstream client.
+			if rtctx := responsesTranslateFromContext(resp.Request.Context()); rtctx != nil {
+				if isEventStream(resp.Header.Get("Content-Type")) {
+					resp.Header.Del("Content-Length")
+					resp.ContentLength = -1
+					resp.Header.Set("Content-Type", "text/event-stream")
+					resp.Body = newResponsesSSETranslator(resp.Body, rtctx)
+					return nil
+				}
+				if !rtctx.stream && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "application/json") && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+					const maxInspect = 10 * 1024 * 1024
+					buf, err := bodylimit.ReadAll(resp.Body, maxInspect)
+					_ = resp.Body.Close()
+					if err != nil {
+						return bodylimit.Wrap("translated chat completion response body", maxInspect, err)
+					}
+					translated, ok, err := translateChatCompletionToResponses(buf, rtctx)
+					if err != nil {
+						return err
+					}
+					if ok {
+						resp.Body = io.NopCloser(bytes.NewReader(translated))
+						resp.ContentLength = int64(len(translated))
+						resp.Header.Set("Content-Type", "application/json")
+						resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(translated)))
+						resp.Header.Del("Transfer-Encoding")
+					} else {
+						resp.Body = io.NopCloser(bytes.NewReader(buf))
+						resp.ContentLength = int64(len(buf))
+						resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(buf)))
+					}
+					return nil
+				}
+				// Upstream returned a non-SSE error or an unexpected shape; pass
+				// through so Amp CLI can surface it.
+				return nil
 			}
 
 			if isEventStream(resp.Header.Get("Content-Type")) {
@@ -410,17 +555,17 @@ func buildProxy(rawURL, apiKey string, overrides map[string]any) (*httputil.Reve
 			} else if isJSONResponsesPath(resp.Request) && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "application/json") {
 				// Non-streaming /v1/responses branch: read up to maxInspect
 				// bytes, check for the "empty output array despite completion
-				// tokens" anomaly, and restore the body untouched. We do not
-				// rewrite here because there is no item.done stream to
-				// accumulate for a single JSON reply.
+				// tokens" anomaly, and restore the body untouched. If the body
+				// exceeds maxInspect, skip inspection and stream the buffered
+				// prefix plus the remaining upstream body to avoid truncation.
 				const maxInspect = 10 * 1024 * 1024
-				buf, err := io.ReadAll(io.LimitReader(resp.Body, maxInspect))
+				buf, okToInspect, err := inspectBody(resp, maxInspect)
 				if err != nil {
 					return err
 				}
-				_ = resp.Body.Close()
-				resp.Body = io.NopCloser(bytes.NewReader(buf))
-				resp.ContentLength = int64(len(buf))
+				if !okToInspect {
+					return nil
+				}
 
 				outputLen := 0
 				if arr := gjson.GetBytes(buf, "output"); arr.IsArray() {
@@ -444,15 +589,15 @@ func buildProxy(rawURL, apiKey string, overrides map[string]any) (*httputil.Reve
 				// back to its own web_search. We only warn here so the
 				// main agent's fallback path keeps working; a future fix
 				// can stream-upgrade the upstream request to recover the
-				// lost content.
+				// lost content. Oversized bodies skip inspection safely.
 				const maxInspect = 10 * 1024 * 1024
-				buf, err := io.ReadAll(io.LimitReader(resp.Body, maxInspect))
+				buf, okToInspect, err := inspectBody(resp, maxInspect)
 				if err != nil {
 					return err
 				}
-				_ = resp.Body.Close()
-				resp.Body = io.NopCloser(bytes.NewReader(buf))
-				resp.ContentLength = int64(len(buf))
+				if !okToInspect {
+					return nil
+				}
 
 				contentLen := 0
 				if arr := gjson.GetBytes(buf, "content"); arr.IsArray() {

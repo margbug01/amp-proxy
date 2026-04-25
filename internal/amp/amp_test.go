@@ -2,6 +2,7 @@ package amp
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -9,10 +10,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/margbug01/amp-proxy/internal/modules"
-	"github.com/margbug01/amp-proxy/internal/config"
 	sdkaccess "github.com/margbug01/amp-proxy/internal/access"
+	"github.com/margbug01/amp-proxy/internal/config"
 	"github.com/margbug01/amp-proxy/internal/handlers"
+	"github.com/margbug01/amp-proxy/internal/modules"
 )
 
 func TestAmpModule_Name(t *testing.T) {
@@ -39,6 +40,39 @@ func TestAmpModule_New(t *testing.T) {
 	}
 	if m.proxy != nil {
 		t.Fatal("proxy should be nil initially")
+	}
+}
+
+func TestAmpModule_Register_DefaultsManagementRestrictionToLocalhost(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("api-keys:\n  - test-key\nampcode:\n  upstream-url: \""+upstream.URL+"\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := NewLegacy(sdkaccess.NewManager(), func(c *gin.Context) { c.Next() })
+	ctx := modules.Context{Engine: r, BaseHandler: &handlers.BaseAPIHandler{}, Config: cfg, AuthMiddleware: func(c *gin.Context) { c.Next() }}
+	if err := m.Register(ctx); err != nil {
+		t.Fatalf("register error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/user", nil)
+	req.RemoteAddr = "203.0.113.42:12345"
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected remote management request to be forbidden by default, got %d", w.Code)
 	}
 }
 
@@ -287,7 +321,7 @@ func TestAmpModule_ProviderAliasesAlwaysRegistered(t *testing.T) {
 		name      string
 		configURL string
 	}{
-		{"with_upstream", "http://example.com"},
+		{"with_upstream", "http://127.0.0.1:1"},
 		{"without_upstream", ""},
 	}
 
@@ -307,11 +341,15 @@ func TestAmpModule_ProviderAliasesAlwaysRegistered(t *testing.T) {
 			}
 
 			// Provider aliases should always be available
-			req := httptest.NewRequest("GET", "/api/provider/openai/models", nil)
-			w := httptest.NewRecorder()
-			r.ServeHTTP(w, req)
+			srv := httptest.NewServer(r)
+			defer srv.Close()
+			resp, err := http.Get(srv.URL + "/api/provider/openai/models")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
 
-			if w.Code == 404 {
+			if resp.StatusCode == http.StatusNotFound {
 				t.Fatal("provider aliases should be registered")
 			}
 		})
