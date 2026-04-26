@@ -169,9 +169,18 @@ func translateResponsesRequestToChat(body []byte) ([]byte, *responsesTranslateCt
 		out["tool_choice"] = tc
 	}
 
+	// Detect whether thinking/reasoning mode is active. DeepSeek requires
+	// every assistant message to carry reasoning_content when thinking is on.
+	thinkingEnabled := false
+	if r, ok := req["reasoning"].(map[string]any); ok {
+		if eff, _ := r["effort"].(string); eff != "" {
+			thinkingEnabled = true
+		}
+	}
+
 	// input → messages. This is the bulk of the translation.
 	inputArr, _ := req["input"].([]any)
-	messages, err := translateInputToMessages(inputArr)
+	messages, err := translateInputToMessages(inputArr, thinkingEnabled)
 	if err != nil {
 		return nil, nil, fmt.Errorf("translate input: %w", err)
 	}
@@ -205,7 +214,7 @@ func translateResponsesRequestToChat(body []byte) ([]byte, *responsesTranslateCt
 //     emits a {"role":"tool", tool_call_id, content}
 //   - `{type:reasoning, ...}` carries DeepSeek's previous reasoning_content;
 //     it is attached to the following assistant/tool_call wrapper message.
-func translateInputToMessages(input []any) ([]any, error) {
+func translateInputToMessages(input []any, thinkingEnabled bool) ([]any, error) {
 	out := make([]any, 0, len(input))
 
 	// pendingAssistant buffers a not-yet-emitted assistant message so that
@@ -226,6 +235,10 @@ func translateInputToMessages(input []any) ([]any, error) {
 			if pendingReasoning != "" {
 				pendingAssistant["reasoning_content"] = pendingReasoning
 				pendingReasoning = ""
+			} else if thinkingEnabled {
+				// DeepSeek requires reasoning_content on every assistant
+				// message when thinking mode is active, even if empty.
+				pendingAssistant["reasoning_content"] = ""
 			}
 		}
 		return pendingAssistant
@@ -348,8 +361,14 @@ func extractMessageText(item map[string]any) string {
 }
 
 func extractReasoningText(item map[string]any) string {
+	// Try encrypted_content first, but skip it if it looks like an
+	// opaque encrypted blob (e.g. GPT-5.x "gAAAAAB…" tokens) because
+	// downstream providers like DeepSeek need plaintext reasoning_content.
 	if s, ok := item["encrypted_content"].(string); ok && s != "" {
-		return s
+		if !strings.HasPrefix(s, "gAAAAAB") {
+			return s
+		}
+		// Fall through to summary which contains the plaintext.
 	}
 	if s, ok := item["reasoning_content"].(string); ok && s != "" {
 		return s
@@ -400,7 +419,7 @@ func translateChatCompletionToResponses(body []byte, tctx *responsesTranslateCtx
 			"id":                synthItemID("rs"),
 			"type":              "reasoning",
 			"status":            "completed",
-			"encrypted_content": "",
+			"encrypted_content": reasoning,
 			"summary": []any{map[string]any{
 				"type": "summary_text",
 				"text": reasoning,
